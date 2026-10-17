@@ -168,6 +168,8 @@ enum HumanActionDetector {
     }
 }
 
+enum GroupingMode: String, Codable { case auto, manual, detached }
+
 struct BoardTask: Identifiable, Codable {
     var id = UUID()
     var title: String
@@ -188,6 +190,8 @@ struct BoardTask: Identifiable, Codable {
     var lastActivityAt = Date()
     var isPinned = false
     var isAutoGroup = false
+    var groupingMode: GroupingMode = .auto
+    var isTitleCustomized = false
 
     var isConversation: Bool { cursorPath != nil || qoderSessionID != nil || codexThreadID != nil }
     var sourceName: String {
@@ -204,7 +208,7 @@ struct BoardTask: Identifiable, Codable {
     private enum CodingKeys: String, CodingKey {
         case id, title, nextStep, link, state, stateSince, createdAt
         case cursorPath, observedLines, qoderSessionID, qoderObservedLines, codexThreadID, lastUserPreview, parentID, boundParentIDs, projectKey
-        case lastActivityAt, isPinned, isAutoGroup
+        case lastActivityAt, isPinned, isAutoGroup, groupingMode, isTitleCustomized
     }
 
     init(from decoder: Decoder) throws {
@@ -227,6 +231,9 @@ struct BoardTask: Identifiable, Codable {
         projectKey = try values.decodeIfPresent(String.self, forKey: .projectKey)
         lastActivityAt = try values.decodeIfPresent(Date.self, forKey: .lastActivityAt) ?? max(stateSince, createdAt)
         isPinned = try values.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
+        groupingMode = try values.decodeIfPresent(GroupingMode.self, forKey: .groupingMode)
+            ?? (parentID == nil && !boundParentIDs.isEmpty ? .manual : .auto)
+        isTitleCustomized = try values.decodeIfPresent(Bool.self, forKey: .isTitleCustomized) ?? false
         let legacyProjectName = projectKey.map { URL(fileURLWithPath: $0).lastPathComponent }
         isAutoGroup = try values.decodeIfPresent(Bool.self, forKey: .isAutoGroup)
             ?? (parentID == nil && !isConversation && projectKey != nil &&
@@ -858,7 +865,10 @@ final class BoardModel: ObservableObject {
     func renameTask(_ id: UUID, to title: String) {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        update(id) { $0.title = trimmed }
+        update(id) { task in
+            task.title = trimmed
+            if task.isAutoGroup { task.isTitleCustomized = true }
+        }
     }
 
     func update(_ id: UUID, _ change: (inout BoardTask) -> Void) {
@@ -882,7 +892,10 @@ final class BoardModel: ObservableObject {
 
     func remove(_ id: UUID) {
         for index in tasks.indices {
-            if tasks[index].parentID == id { tasks[index].parentID = nil }
+            if tasks[index].parentID == id {
+                tasks[index].parentID = nil
+                tasks[index].groupingMode = tasks[index].boundParentIDs.filter { $0 != id }.isEmpty ? .detached : .manual
+            }
             tasks[index].boundParentIDs.removeAll { $0 == id }
         }
         tasks.removeAll { $0.id == id }
@@ -903,6 +916,7 @@ final class BoardModel: ObservableObject {
         update(childID) { task in
             task.parentID = parentID
             task.boundParentIDs.removeAll()
+            task.groupingMode = parentID == nil ? .detached : .manual
         }
         save()
     }
@@ -919,6 +933,7 @@ final class BoardModel: ObservableObject {
             child.state = .ready
             child.isPinned = Date().timeIntervalSince(recent.modified) >= 24 * 3600
             child.boundParentIDs = [parentID]
+            child.groupingMode = .manual
             tasks.insert(child, at: 0)
             let newID = child.id
             let initialStateSince = child.stateSince
@@ -940,6 +955,7 @@ final class BoardModel: ObservableObject {
         update(childID) { task in
             guard !task.belongs(to: parentID) else { return }
             task.boundParentIDs.append(parentID)
+            if task.parentID == nil { task.groupingMode = .manual }
             if Date().timeIntervalSince(task.lastActivityAt) >= 24 * 3600 { task.isPinned = true }
         }
         save()
@@ -951,11 +967,20 @@ final class BoardModel: ObservableObject {
             if task.parentID == parentID {
                 task.parentID = task.boundParentIDs.first
                 if !task.boundParentIDs.isEmpty { task.boundParentIDs.removeFirst() }
+                task.groupingMode = task.parentID == nil ? .detached : .manual
             } else {
                 task.boundParentIDs.removeAll { $0 == parentID }
+                if task.parentID == nil && task.boundParentIDs.isEmpty { task.groupingMode = .detached }
             }
         }
         save()
+    }
+
+    func restoreAutomaticGrouping(_ childID: UUID) {
+        guard let child = tasks.first(where: { $0.id == childID }), child.isConversation,
+              let key = child.projectKey, !key.isEmpty else { return }
+        update(childID) { $0.groupingMode = .auto; $0.parentID = nil }
+        ensureProjectParent(for: childID, key: key, title: URL(fileURLWithPath: key).lastPathComponent)
     }
 
     func bindableSessions(for parentID: UUID) -> [BoardTask] {
@@ -1033,7 +1058,12 @@ final class BoardModel: ObservableObject {
             destinations[key] = canonical.id
             for group in groups { replacements[group.id] = canonical.id }
             guard let index = result.firstIndex(where: { $0.id == canonical.id }) else { continue }
-            result[index].title = URL(fileURLWithPath: key).lastPathComponent
+            if let customized = groups.first(where: { $0.isTitleCustomized }) {
+                result[index].title = customized.title
+                result[index].isTitleCustomized = true
+            } else {
+                result[index].title = URL(fileURLWithPath: key).lastPathComponent
+            }
             result[index].isPinned = groups.contains { $0.isPinned }
             for group in groups.dropFirst() {
                 removed.insert(group.id)
@@ -1060,10 +1090,9 @@ final class BoardModel: ObservableObject {
     }
 
     private func ensureProjectParent(for childID: UUID, key: String, title: String) {
-        guard !key.isEmpty, let child = tasks.first(where: { $0.id == childID }) else { return }
+        guard !key.isEmpty, let child = tasks.first(where: { $0.id == childID }), child.groupingMode == .auto else { return }
         if let parentID = child.parentID,
            let parent = tasks.first(where: { $0.id == parentID }), !parent.isAutoGroup { return }
-        if child.parentID == nil && !child.boundParentIDs.isEmpty { return }
         let parentID: UUID
         if let existing = tasks.first(where: { $0.isAutoGroup && !$0.isConversation && $0.projectKey == key }) {
             parentID = existing.id
@@ -1922,6 +1951,9 @@ struct TaskCard: View {
                 }
             }
             if task.isConversation {
+                if task.groupingMode != .auto {
+                    Button("恢复自动归组") { model.restoreAutomaticGrouping(task.id); menuOpen = false }
+                }
                 ForEach(model.parentCandidates(for: task)) { parent in
                     Button("挂到：\(parent.title)") { model.assignParent(task.id, to: parent.id); menuOpen = false }
                 }
@@ -2400,7 +2432,32 @@ func runPersistenceSelfTest() throws {
     print("Persistence recovery self-test passed")
 }
 
-if CommandLine.arguments.contains("--cache-concurrency-self-test") {
+if CommandLine.arguments.contains("--grouping-intent-self-test") {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-intent-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
+    let session = CodexSession(id: "intent-thread", title: "会话", lastUserPreview: "合成输入", state: .waiting,
+                               modified: Date(), projectKey: directory.path, projectTitle: "project")
+    model.mergeCodex([session])
+    let child = model.tasks.first { $0.codexThreadID == session.id }!
+    let parent = model.tasks.first { $0.isAutoGroup }!
+    model.renameTask(parent.id, to: "用户自定义主体")
+    model.assignParent(child.id, to: nil)
+    model.mergeCodex([session]); model.mergeCodex([session])
+    precondition(model.tasks.first { $0.id == child.id }!.parentID == nil)
+    let restored = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
+    restored.mergeCodex([session])
+    precondition(restored.tasks.first { $0.id == child.id }!.groupingMode == .detached)
+    precondition(restored.tasks.first { $0.id == child.id }!.parentID == nil)
+    precondition(restored.tasks.first { $0.id == parent.id }!.title == "用户自定义主体")
+    restored.restoreAutomaticGrouping(child.id)
+    precondition(restored.tasks.first { $0.id == child.id }!.parentID == parent.id)
+    let twice = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
+    precondition(twice.tasks.first { $0.id == parent.id }!.title == "用户自定义主体")
+    let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+    precondition(try! encoder.encode(BoardModel.normalizedAutoGroups(twice.tasks)) == encoder.encode(twice.tasks))
+    print("Grouping intent self-test passed")
+} else if CommandLine.arguments.contains("--cache-concurrency-self-test") {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-cache-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
