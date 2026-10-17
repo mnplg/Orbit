@@ -10,10 +10,10 @@ export HOME="$WORK/home"
 export CFFIXED_USER_HOME="$WORK/home"
 export ORBIT_SYNTHETIC_ROOT="$WORK"
 ulimit -c 0
-swiftc -module-cache-path "${ORBIT_MODULE_CACHE:-$WORK/module-cache}" -framework AppKit -framework SwiftUI "$ROOT/Sources/main.swift" "$ROOT/Sources/QoderDesktopNavigator.swift" -o "$WORK/Orbit"
+swiftc -module-cache-path "${ORBIT_MODULE_CACHE:-$WORK/module-cache}" -framework AppKit -framework SwiftUI "$ROOT/Sources/main.swift" "$ROOT/Sources/QoderDesktopNavigator.swift" "$ROOT/Sources/RecoveryViews.swift" -o "$WORK/Orbit"
 swiftc -module-cache-path "${ORBIT_MODULE_CACHE:-$WORK/module-cache}" -O "$ROOT/Sources/qoder-hook.swift" -o "$WORK/QoderHook"
 swiftc -module-cache-path "${ORBIT_MODULE_CACHE:-$WORK/module-cache}" -framework AppKit "$ROOT/Sources/QoderDesktopNavigator.swift" "$ROOT/Tests/QoderDesktopNavigation/main.swift" -o "$WORK/navigation-tests"
-for name in codex-recent auto-group-repair qoder-resume human-state codex grouping lifecycle persistence cache-concurrency grouping-intent completion-override pinned-navigation codex-format poll-snapshot; do
+for name in codex-recent auto-group-repair qoder-resume human-state codex grouping lifecycle persistence cache-concurrency grouping-intent completion-override pinned-navigation codex-format poll-snapshot recovery-ui; do
     "$WORK/Orbit" "--$name-self-test"
 done
 "$WORK/navigation-tests"

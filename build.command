@@ -2,7 +2,11 @@
 set -euo pipefail
 
 ROOT="${0:A:h}"
-APP="$ROOT/Orbit.app"
+APP="${ORBIT_BUILD_OUTPUT:-$ROOT/Orbit.app}"
+orbit_swift_args=()
+if [[ -n "${ORBIT_MODULE_CACHE:-}" ]]; then
+  orbit_swift_args=(-module-cache-path "$ORBIT_MODULE_CACHE")
+fi
 mkdir -p "$APP/Contents/MacOS"
 mkdir -p "$APP/Contents/Resources"
 
@@ -23,8 +27,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict></plist>
 PLIST
 
-swiftc -framework AppKit -framework SwiftUI "$ROOT/Sources/main.swift" "$ROOT/Sources/QoderDesktopNavigator.swift" -o "$APP/Contents/MacOS/DeskFocusBoard"
-swiftc -O "$ROOT/Sources/qoder-hook.swift" -o "$APP/Contents/MacOS/QoderHook"
+swiftc "${orbit_swift_args[@]}" -framework AppKit -framework SwiftUI "$ROOT/Sources/main.swift" "$ROOT/Sources/QoderDesktopNavigator.swift" "$ROOT/Sources/RecoveryViews.swift" -o "$APP/Contents/MacOS/DeskFocusBoard"
+swiftc "${orbit_swift_args[@]}" -O "$ROOT/Sources/qoder-hook.swift" -o "$APP/Contents/MacOS/QoderHook"
 cp "$ROOT/Assets/starlight-mascot.png" "$APP/Contents/Resources/starlight-mascot.png"
 cp "$ROOT/Assets/starlight-clouds.png" "$APP/Contents/Resources/starlight-clouds.png"
 cp "$ROOT/Assets/orbit-icon.png" "$APP/Contents/Resources/orbit-icon.png"

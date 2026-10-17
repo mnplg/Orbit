@@ -1424,9 +1424,10 @@ final class BoardModel: ObservableObject {
         return url
     }
 
-    func openConversation(for task: BoardTask, now: Date = Date()) {
+    func openConversation(for task: BoardTask, now: Date = Date(), opener: ((BoardTask) -> Bool)? = nil) {
         guard let selected = navigationTarget(for: task, now: now),
               let target = validatedNavigationTarget(selected, for: task, now: now) else { return }
+        if let opener { _ = opener(target); return }
         let trimmed = target.link.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty {
             guard let url = directURL(for: target), NSWorkspace.shared.open(url) else {
@@ -1792,6 +1793,7 @@ struct BoardView: View {
     @State private var showCompleted = false
     @State private var showNewTaskField = false
     @State private var showStarredOnly = false
+    @State private var showHiddenRecovery = false
     @State private var now = Date()
 
     private var skin: BoardSkin { BoardSkin(rawValue: skinRaw) ?? .midnight }
@@ -1870,6 +1872,7 @@ struct BoardView: View {
         .preferredColorScheme(theme.isLight ? .light : .dark)
         .environment(\.boardTheme, theme)
         .onReceive(Timer.publish(every: 30, on: .main, in: .common).autoconnect()) { now = $0 }
+        .sheet(isPresented: $showHiddenRecovery) { HiddenRecoverySheet(model: model, now: now) }
     }
 
     private var header: some View {
@@ -2007,7 +2010,9 @@ struct BoardView: View {
             Circle().fill(theme.stateTint(.waiting)).frame(width: 6, height: 6)
             Text("等待会话 \(model.tasks.filter { $0.isConversation && $0.state == .waiting && model.isVisible($0, now: now) }.count)")
             Spacer()
-            Text("数据保存在本机")
+            Button("找回已隐藏事项") { showHiddenRecovery = true }
+                .buttonStyle(.plain)
+                .help("隐藏不等于删除；查看隐藏原因并保留显示")
         }
         .font(.system(size: 10, weight: .medium))
         .foregroundStyle(theme.secondaryText)
@@ -2027,6 +2032,7 @@ struct TaskCard: View {
     @State private var binding = false
     @State private var bindingSearch = ""
     @State private var menuOpen = false
+    @State private var detailTask: BoardTask?
 
     private var displayState: TaskState { model.displayState(for: task) }
     private var stateColor: Color { theme.stateTint(displayState) }
@@ -2215,6 +2221,7 @@ struct TaskCard: View {
         }
         .overlay(RoundedRectangle(cornerRadius: 13).stroke(theme.border.opacity(0.55)))
         .shadow(color: theme.isLight ? Color(red: 0.32, green: 0.45, blue: 0.65).opacity(0.10) : theme.accent.opacity(0.13), radius: 10, y: 3)
+        .sheet(item: $detailTask) { item in TaskDetailsSheet(task: item, model: model) }
     }
 
     private func beginTitleEdit() {
@@ -2237,6 +2244,8 @@ struct TaskCard: View {
 
     private var taskMenu: some View {
         VStack(alignment: .leading, spacing: 3) {
+            Button("查看完整详情") { detailTask = task; menuOpen = false }
+            Divider()
             if !task.isConversation && task.completionOverride {
                 Button("重新打开主体") { model.setState(task.id, to: .working); menuOpen = false }
             }
@@ -2308,6 +2317,7 @@ struct TaskCard: View {
                             let isRecentCodex = candidate.codexThreadID != nil &&
                                 !model.tasks.contains { $0.codexThreadID == candidate.codexThreadID }
                             let projectName = candidate.projectKey.map { URL(fileURLWithPath: $0).lastPathComponent } ?? ""
+                            HStack(spacing: 6) {
                             Button {
                                 model.bindSession(candidate.id, to: task.id)
                             } label: {
@@ -2330,6 +2340,12 @@ struct TaskCard: View {
                             .buttonStyle(.plain)
                             .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(theme.primaryText.opacity(0.9))
+                            .help("\(candidate.sourceName) · \(candidate.title)\n\(candidate.projectKey ?? "")")
+                            Button { detailTask = candidate } label: { Image(systemName: "info.circle").frame(width: 26, height: 30) }
+                                .buttonStyle(.plain)
+                                .help("查看完整详情，不绑定会话")
+                                .accessibilityLabel("查看完整详情：\(candidate.title)")
+                            }
                         }
                     }
                 }
@@ -2351,6 +2367,7 @@ struct SessionRow: View {
     let showSource: Bool
     @Environment(\.boardTheme) private var theme
     @State private var menuOpen = false
+    @State private var detailTask: BoardTask?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -2406,6 +2423,7 @@ struct SessionRow: View {
             }
         }
         .padding(.vertical, 3)
+        .sheet(item: $detailTask) { item in TaskDetailsSheet(task: item, model: model) }
     }
 
     private var relativeTime: String {
@@ -2418,12 +2436,17 @@ struct SessionRow: View {
 
     private var sessionMenu: some View {
         VStack(alignment: .leading, spacing: 3) {
+            Button("查看完整详情") { detailTask = task; menuOpen = false }
+            Divider()
             ForEach(TaskState.allCases) { state in
                 Button(state.rawValue) { model.setState(task.id, to: state); menuOpen = false }
             }
             Divider()
             ForEach(model.parentCandidates(for: task)) { parent in
                 Button("移到：\(parent.title)") { model.assignParent(task.id, to: parent.id); menuOpen = false }
+            }
+            if task.groupingMode != .auto {
+                Button("恢复自动归组") { model.restoreAutomaticGrouping(task.id); menuOpen = false }
             }
             if let parentID {
                 Button("移出主体任务") { model.unbindSession(task.id, from: parentID); menuOpen = false }
@@ -2714,7 +2737,46 @@ func runPersistenceSelfTest() throws {
     print("Persistence recovery self-test passed")
 }
 
-if CommandLine.arguments.contains("--poll-snapshot-self-test") {
+if CommandLine.arguments.contains("--recovery-ui-self-test") {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-recovery-ui-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
+    let now = Date(timeIntervalSince1970: 2_000_000_000)
+    var recentParent = BoardTask(title: "recent"); recentParent.isAutoGroup = true; recentParent.projectKey = directory.appendingPathComponent("recent").path
+    var oldParent = BoardTask(title: "old"); oldParent.isAutoGroup = true; oldParent.projectKey = directory.appendingPathComponent("old").path
+    var human = BoardTask(title: "完整的很长很长会话名称，具有相似前缀A")
+    human.qoderSessionID = "hidden-human"; human.projectKey = recentParent.projectKey; human.parentID = recentParent.id
+    human.state = .human; human.lastActivityAt = now.addingTimeInterval(-25 * 3600)
+    var older = BoardTask(title: "完整的很长很长会话名称，具有相似前缀B")
+    older.codexThreadID = "hidden-old"; older.projectKey = oldParent.projectKey; older.parentID = oldParent.id
+    older.state = .ready; older.lastActivityAt = now.addingTimeInterval(-8 * 86400)
+    var other = BoardTask(title: "另一条隐藏会话")
+    other.qoderSessionID = "hidden-other"; other.projectKey = oldParent.projectKey; other.parentID = oldParent.id
+    other.state = .waiting; other.lastActivityAt = older.lastActivityAt
+    model.tasks = [recentParent, oldParent, human, older, other]
+    precondition(model.isVisible(human, now: human.lastActivityAt.addingTimeInterval(24 * 3600 - 1)))
+    precondition(!model.isVisible(human, now: human.lastActivityAt.addingTimeInterval(24 * 3600 + 1)))
+    precondition(model.isVisible(oldParent, now: older.lastActivityAt.addingTimeInterval(7 * 86400 - 1)))
+    precondition(!model.isVisible(oldParent, now: older.lastActivityAt.addingTimeInterval(7 * 86400 + 1)))
+    let hidden = Set(model.hiddenItems(now: now).map(\.id))
+    precondition(hidden.contains(human.id) && hidden.contains(oldParent.id))
+    precondition(model.hiddenReason(for: human).contains("24小时"))
+    precondition(model.hiddenReason(for: oldParent).contains("7天"))
+    model.restoreHiddenItem(oldParent.id, now: now)
+    for original in [older, other] {
+        let restored = model.tasks.first { $0.id == original.id }!
+        precondition(restored.isPinned && restored.state == original.state && restored.parentID == original.parentID && restored.boundParentIDs == original.boundParentIDs)
+    }
+    precondition(model.isVisible(model.tasks.first { $0.id == oldParent.id }!, now: now))
+    let reloaded = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
+    for _ in 0..<2 {
+        let ticket = reloaded.beginPoll()!
+        precondition(reloaded.commitPollSnapshot(BoardPollSnapshot(), ticket: ticket))
+    }
+    precondition(reloaded.tasks.first { $0.id == older.id }!.isPinned && reloaded.tasks.first { $0.id == other.id }!.isPinned)
+    precondition(reloaded.tasks.first { $0.id == human.id }!.state == .human)
+    print("Recovery/details synthetic model self-test passed (ordinary UI untested)")
+} else if CommandLine.arguments.contains("--poll-snapshot-self-test") {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-poll-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: directory) }
     let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
@@ -2894,12 +2956,21 @@ if CommandLine.arguments.contains("--poll-snapshot-self-test") {
     let stable = [older.id, oldest.id].sorted { $0.uuidString < $1.uuidString }.first!
     precondition(model.navigationTarget(for: parent, now: now)?.id == stable)
     let selected = model.navigationTarget(for: parent, now: now)!
+    var opened: [UUID] = []
+    let context = model.tasks
+    model.openConversation(for: parent, now: now, opener: { opened.append($0.id); return false })
+    precondition(opened == [selected.id] && model.tasks == context)
     model.assignParent(selected.id, to: nil)
     precondition(model.validatedNavigationTarget(selected, for: parent, now: now) == nil)
     model.remove(newest.id)
     precondition(model.navigationTarget(for: newest, now: now) == nil)
+    opened = []
+    model.openConversation(for: newest, now: now, opener: { opened.append($0.id); return true })
+    precondition(opened.isEmpty)
     for child in model.children(of: parent.id) { model.remove(child.id) }
     precondition(model.navigationTarget(for: parent, now: now) == nil)
+    model.openConversation(for: parent, now: now, opener: { opened.append($0.id); return true })
+    precondition(opened.isEmpty)
     print("Pinned navigation self-test passed")
 } else if CommandLine.arguments.contains("--completion-override-self-test") {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-completion-" + UUID().uuidString)
