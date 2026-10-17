@@ -436,6 +436,10 @@ enum QoderReader {
     }
 }
 
+enum CodexReadDiagnostic: String {
+    case recognizedState, irrelevant, incompleteTail, unknownStateSchema, readFailure
+}
+
 struct CodexSession {
     let id: String
     let title: String
@@ -444,6 +448,8 @@ struct CodexSession {
     let modified: Date
     let projectKey: String
     let projectTitle: String
+    var stateIsTrusted = true
+    var readDiagnostic: CodexReadDiagnostic = .recognizedState
 }
 
 struct CodexRecentThread {
@@ -460,7 +466,7 @@ enum CodexReader {
 
     static func recentThreads(databaseURL: URL = databaseURL) -> [CodexRecentThread] {
         SyntheticAccess.check(databaseURL)
-        SyntheticAccess.check(databaseURL)
+        databaseResult(databaseURL, .readFailure)
         var database: OpaquePointer?
         guard sqlite3_open_v2(databaseURL.path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
               let database else {
@@ -480,7 +486,9 @@ enum CodexReader {
               let statement else { return [] }
         defer { sqlite3_finalize(statement) }
         var found: [CodexRecentThread] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        var step = sqlite3_step(statement)
+        while step == SQLITE_ROW {
+            defer { step = sqlite3_step(statement) }
             guard let rawID = sqlite3_column_text(statement, 0),
                   let rawTitle = sqlite3_column_text(statement, 1) else { continue }
             let id = String(cString: rawID)
@@ -496,19 +504,24 @@ enum CodexReader {
                                            modified: modified, projectKey: projectKey,
                                            rolloutPath: rolloutPath))
         }
+        guard step == SQLITE_DONE else { return [] }
+        databaseResult(databaseURL, .irrelevant)
         return found
     }
 
     static func recentActivity(at path: String) -> (TaskState, String)? {
         SyntheticAccess.check(URL(fileURLWithPath: path))
-        guard FileManager.default.fileExists(atPath: path) else { return nil }
         let activity = latestActivity(at: path)
+        guard activity.stateIsTrusted else { return nil }
         return (activity.state, activity.lastUserPreview)
     }
 
     private struct Activity {
         let state: TaskState
         let lastUserPreview: String
+        var diagnostic: CodexReadDiagnostic = .recognizedState
+        var stateIsTrusted = true
+        var scannedLines = 0
     }
 
     private struct CachedState {
@@ -518,9 +531,20 @@ enum CodexReader {
     }
     private static var stateCache: [String: CachedState] = [:]
     private static let stateQueue = DispatchQueue(label: "local.orbit.codex-state-cache")
+    private static var databaseDiagnostics: [String: CodexReadDiagnostic] = [:]
+
+    static func diagnostic(at path: String) -> CodexReadDiagnostic { latestActivity(at: path).diagnostic }
+    static func scannedLineCount(at path: String) -> Int { latestActivity(at: path).scannedLines }
+    static func databaseDiagnostic(at url: URL) -> CodexReadDiagnostic? {
+        stateQueue.sync { databaseDiagnostics[url.path] }
+    }
+    private static func databaseResult(_ url: URL, _ result: CodexReadDiagnostic) {
+        stateQueue.sync { databaseDiagnostics[url.path] = result }
+    }
 
     static func sessions(databaseURL: URL = databaseURL, now: Date = Date()) -> [CodexSession] {
         SyntheticAccess.check(databaseURL)
+        databaseResult(databaseURL, .readFailure)
         var database: OpaquePointer?
         guard sqlite3_open_v2(databaseURL.path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
               let database else {
@@ -541,7 +565,9 @@ enum CodexReader {
         defer { sqlite3_finalize(statement) }
         sqlite3_bind_int64(statement, 1, Int64(now.addingTimeInterval(-7 * 86400).timeIntervalSince1970))
         var found: [CodexSession] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        var step = sqlite3_step(statement)
+        while step == SQLITE_ROW {
+            defer { step = sqlite3_step(statement) }
             guard let rawID = sqlite3_column_text(statement, 0),
                   let rawTitle = sqlite3_column_text(statement, 1),
                   let rawRollout = sqlite3_column_text(statement, 3) else { continue }
@@ -555,6 +581,7 @@ enum CodexReader {
                 : URL(fileURLWithPath: cwd).standardizedFileURL.path
             let projectTitle = cwd.isEmpty ? "Codex" : URL(fileURLWithPath: projectPath).lastPathComponent
             let databaseModified = Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(statement, 4)))
+            SyntheticAccess.check(URL(fileURLWithPath: rolloutPath))
             let attrs = try? FileManager.default.attributesOfItem(atPath: rolloutPath)
             let fileModified = attrs?[.modificationDate] as? Date ?? .distantPast
             let modified = min(max(databaseModified, fileModified), now)
@@ -562,8 +589,11 @@ enum CodexReader {
             found.append(CodexSession(id: id, title: String(title.prefix(90)),
                                       lastUserPreview: activity.lastUserPreview,
                                       state: activity.state, modified: modified,
-                                      projectKey: projectPath, projectTitle: projectTitle))
+                                      projectKey: projectPath, projectTitle: projectTitle,
+                                      stateIsTrusted: activity.stateIsTrusted, readDiagnostic: activity.diagnostic))
         }
+        guard step == SQLITE_DONE else { return [] }
+        databaseResult(databaseURL, .irrelevant)
         return found
     }
 
@@ -576,108 +606,113 @@ enum CodexReader {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
               let size = attrs[.size] as? Int,
               let modified = attrs[.modificationDate] as? Date else {
-            return Activity(state: .working, lastUserPreview: "")
+            return Activity(state: stateCache[path]?.activity.state ?? .working,
+                            lastUserPreview: stateCache[path]?.activity.lastUserPreview ?? "",
+                            diagnostic: .readFailure, stateIsTrusted: false)
         }
         if let cached = stateCache[path], cached.size == size, cached.modified == modified {
             return cached.activity
         }
-        let activity = scanLatestActivity(at: path, size: size)
-        stateCache[path] = CachedState(size: size, modified: modified, activity: activity)
+        var activity = scanLatestActivity(at: path, size: size)
+        if !activity.stateIsTrusted, let trusted = stateCache[path]?.activity {
+            activity = Activity(state: trusted.state,
+                                lastUserPreview: activity.lastUserPreview.isEmpty ? trusted.lastUserPreview : activity.lastUserPreview,
+                                diagnostic: activity.diagnostic, stateIsTrusted: false, scannedLines: activity.scannedLines)
+        }
+        // An incomplete tail must be re-read even if a writer preserves size and mtime.
+        if activity.stateIsTrusted && activity.diagnostic != .incompleteTail {
+            stateCache[path] = CachedState(size: size, modified: modified, activity: activity)
+        }
         return activity
     }
 
     private static func scanLatestActivity(at path: String, size: Int) -> Activity {
-        let fallback = Activity(state: .working, lastUserPreview: "")
-        guard size > 0,
-              let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe) else { return fallback }
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe) else {
+            return Activity(state: .working, lastUserPreview: "", diagnostic: .readFailure, stateIsTrusted: false)
+        }
+        var end = data.endIndex
+        var isTail = true
+        var scannedLines = 0
+        let newline = Data([10])
         var state: TaskState?
         var lastInput: String?
-        var completionStart: Int?
-        let stateMarkers = ["task_started", "task_complete", "turn_aborted"].map { Data($0.utf8) }
-        var stateEnd = data.endIndex
-        while state == nil, let match = latestRange(of: stateMarkers, in: data, before: stateEnd) {
-            state = eventState(in: line(containing: match, in: data))
-            if state == .ready { completionStart = match.lowerBound }
-            stateEnd = match.lowerBound
-        }
-        let userMarker = Data("\"role\":\"user\"".utf8)
-        var userEnd = data.endIndex
-        var lastUserStart = data.startIndex
-        while lastInput == nil,
-              let match = data.range(of: userMarker, options: .backwards, in: data.startIndex..<userEnd) {
-            lastInput = userText(in: line(containing: match, in: data))
-            if lastInput != nil { lastUserStart = match.lowerBound }
-            userEnd = match.lowerBound
-        }
-        if let completionStart, lastUserStart < completionStart {
-            let assistantMarker = Data("\"role\":\"assistant\"".utf8)
-            var assistantEnd = completionStart
-            while let match = data.range(of: assistantMarker, options: .backwards,
-                                         in: lastUserStart..<assistantEnd) {
-                if let reply = assistantText(in: line(containing: match, in: data)) {
-                    if HumanActionDetector.needsHuman(reply) { state = .human }
-                    break
-                }
-                assistantEnd = match.lowerBound
+        var reply: String?
+        var stateIndex: Int?
+        var userIndex: Int?
+        var replyIndex: Int?
+        var diagnostic: CodexReadDiagnostic = .irrelevant
+        var unknownStateIndex: Int?
+        while end > data.startIndex {
+            while end > data.startIndex && data[end - 1] == 10 { end -= 1 }
+            guard end > data.startIndex else { break }
+            let start = data.range(of: newline, options: .backwards, in: data.startIndex..<end)?.upperBound ?? data.startIndex
+            let row = data[start..<end]
+            end = start > data.startIndex ? start - 1 : data.startIndex
+            let index = start // Byte offsets preserve chronology without scanning the entire file.
+            scannedLines += 1
+            guard let event = (try? JSONSerialization.jsonObject(with: Data(row))) as? [String: Any] else {
+                if isTail { diagnostic = .incompleteTail }
+                isTail = false
+                continue
             }
+            isTail = false
+            if event["type"] as? String == "event_msg" {
+                let payload = event["payload"] as? [String: Any]
+                let kind = payload?["type"] as? String
+                if let recognized = eventState(in: event), state == nil {
+                    state = recognized; stateIndex = index
+                } else if kind == nil || kind!.hasPrefix("task_") || kind!.hasPrefix("turn_") {
+                    if eventState(in: event) == nil {
+                        if unknownStateIndex == nil { unknownStateIndex = index }
+                        if diagnostic != .incompleteTail { diagnostic = .unknownStateSchema }
+                    }
+                }
+            }
+            if lastInput == nil, let preview = userText(in: event) { lastInput = preview; userIndex = index }
+            if reply == nil, let text = assistantText(in: event) { reply = text; replyIndex = index }
+            if state != nil && lastInput != nil { break }
         }
-        return Activity(state: state ?? .working, lastUserPreview: lastInput ?? "")
+        if state == .ready, let completion = stateIndex, let user = userIndex,
+           let assistant = replyIndex, completion > assistant && assistant > user,
+           let reply, HumanActionDetector.needsHuman(reply) { state = .human }
+        if diagnostic == .unknownStateSchema, let recognized = stateIndex, let unknown = unknownStateIndex,
+           recognized > unknown { diagnostic = .recognizedState }
+        if diagnostic == .irrelevant && state != nil { diagnostic = .recognizedState }
+        let trustworthy = state != nil && diagnostic != .incompleteTail && diagnostic != .unknownStateSchema
+        return Activity(state: state ?? .working, lastUserPreview: lastInput ?? "",
+                        diagnostic: diagnostic, stateIsTrusted: trustworthy, scannedLines: scannedLines)
     }
 
-    private static func latestRange(of markers: [Data], in data: Data, before end: Int) -> Range<Int>? {
-        markers.compactMap { data.range(of: $0, options: .backwards, in: data.startIndex..<end) }
-            .max { $0.lowerBound < $1.lowerBound }
-    }
-
-    private static func line(containing match: Range<Int>, in data: Data) -> Data.SubSequence {
-        let start = data[..<match.lowerBound].lastIndex(of: 10).map { $0 + 1 } ?? data.startIndex
-        let end = data[match.upperBound...].firstIndex(of: 10) ?? data.endIndex
-        return data[start..<end]
-    }
-
-    private static func userText(in line: Data.SubSequence) -> String? {
-        guard line.range(of: Data("\"type\":\"response_item\"".utf8)) != nil,
-              line.range(of: Data("\"role\":\"user\"".utf8)) != nil,
-              let event = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any],
+    private static func userText(in event: [String: Any]) -> String? {
+        guard event["type"] as? String == "response_item",
               let payload = event["payload"] as? [String: Any],
-              payload["type"] as? String == "message",
-              payload["role"] as? String == "user",
+              payload["type"] as? String == "message", payload["role"] as? String == "user",
               let content = payload["content"] as? [[String: Any]] else { return nil }
         let text = content.filter { $0["type"] as? String == "input_text" }
             .compactMap { $0["text"] as? String }.joined(separator: " ")
         if text.hasPrefix("<environment_context>") { return nil }
         let authoredText: String
-        if text.hasPrefix("# Files mentioned by the user:"),
-           let request = text.range(of: "## My request:") {
+        if text.hasPrefix("# Files mentioned by the user:"), let request = text.range(of: "## My request:") {
             authoredText = String(text[request.upperBound...])
-        } else {
-            authoredText = text
-        }
+        } else { authoredText = text }
         let preview = userInputPreview(authoredText)
         return preview.isEmpty ? nil : preview
     }
 
-    private static func assistantText(in line: Data.SubSequence) -> String? {
-        guard line.range(of: Data("\"type\":\"response_item\"".utf8)) != nil,
-              let event = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any],
+    private static func assistantText(in event: [String: Any]) -> String? {
+        guard event["type"] as? String == "response_item",
               let payload = event["payload"] as? [String: Any],
-              payload["type"] as? String == "message",
-              payload["role"] as? String == "assistant",
+              payload["type"] as? String == "message", payload["role"] as? String == "assistant",
               let content = payload["content"] as? [[String: Any]] else { return nil }
         let reply = content.filter { $0["type"] as? String == "output_text" }
             .compactMap { $0["text"] as? String }.joined(separator: " ")
         return reply.isEmpty ? nil : reply
     }
 
-    private static func eventState(in line: Data.SubSequence) -> TaskState? {
-        guard line.range(of: Data("\"type\":\"event_msg\"".utf8)) != nil,
-              (line.range(of: Data("task_started".utf8)) != nil ||
-               line.range(of: Data("task_complete".utf8)) != nil ||
-               line.range(of: Data("turn_aborted".utf8)) != nil),
-              let event = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any],
-              let payload = event["payload"] as? [String: Any],
-              let eventType = payload["type"] as? String else { return nil }
-        switch eventType {
+    private static func eventState(in event: [String: Any]) -> TaskState? {
+        guard event["type"] as? String == "event_msg", let payload = event["payload"] as? [String: Any],
+              let type = payload["type"] as? String else { return nil }
+        switch type {
         case "task_started": return .waiting
         case "task_complete": return .ready
         case "turn_aborted": return .working
@@ -1373,10 +1408,10 @@ final class BoardModel: ObservableObject {
                 }
                 ensureProjectParent(for: childID, key: session.projectKey, title: session.projectTitle)
                 guard let current = tasks.firstIndex(where: { $0.id == childID }) else { continue }
-                if tasks[current].lastUserPreview != session.lastUserPreview {
+                if !session.lastUserPreview.isEmpty && tasks[current].lastUserPreview != session.lastUserPreview {
                     tasks[current].lastUserPreview = session.lastUserPreview
                 }
-                if session.modified > tasks[current].lastActivityAt {
+                if session.stateIsTrusted && session.modified > tasks[current].lastActivityAt {
                     tasks[current].lastActivityAt = session.modified
                     if tasks[current].state != .done && tasks[current].state != session.state {
                         tasks[current].state = session.state
@@ -2460,7 +2495,70 @@ func runPersistenceSelfTest() throws {
     print("Persistence recovery self-test passed")
 }
 
-if CommandLine.arguments.contains("--pinned-navigation-self-test") {
+if CommandLine.arguments.contains("--codex-format-self-test") {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-format-" + UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let file = directory.appendingPathComponent("thread.jsonl")
+    let user: [String: Any] = ["type": "response_item", "payload": ["type": "message", "role": "user", "content": [["type": "input_text", "text": "格式一致"]]]]
+    let reply: [String: Any] = ["type": "response_item", "payload": ["type": "message", "role": "assistant", "content": [["type": "output_text", "text": "请确认目录。"]]]]
+    let complete: [String: Any] = ["type": "event_msg", "payload": ["type": "task_complete"]]
+    for options: JSONSerialization.WritingOptions in [[], [.sortedKeys]] {
+        let records = try [user, reply, complete].map { try JSONSerialization.data(withJSONObject: $0, options: options) }
+        var text = records.map { String(data: $0, encoding: .utf8)! }.joined(separator: "\n")
+        text = text.replacingOccurrences(of: ":", with: ": ").replacingOccurrences(of: ",", with: ", ")
+        try text.write(to: file, atomically: true, encoding: .utf8)
+        precondition(CodexReader.recentActivity(at: file.path)?.0 == .human)
+        precondition(CodexReader.recentActivity(at: file.path)?.1 == "格式一致")
+    }
+    let started = "{\"type\": \"event_msg\", \"payload\": {\"type\": \"task_started\"}}"
+    try (started + "\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"").write(to: file, atomically: true, encoding: .utf8)
+    precondition(CodexReader.diagnostic(at: file.path) == .incompleteTail)
+    try (started + "\n{\"payload\":{\"type\":\"task_complete\"},\"type\":\"event_msg\"}").write(to: file, atomically: true, encoding: .utf8)
+    precondition(CodexReader.recentActivity(at: file.path)?.0 == .ready)
+    try "{\"type\":\"session_meta\",\"payload\":{}}".write(to: file, atomically: true, encoding: .utf8)
+    precondition(CodexReader.diagnostic(at: file.path) == .irrelevant)
+    try "{\"type\":\"event_msg\",\"payload\":{}}".write(to: file, atomically: true, encoding: .utf8)
+    precondition(CodexReader.diagnostic(at: file.path) == .unknownStateSchema)
+    try FileManager.default.removeItem(at: file)
+    precondition(CodexReader.diagnostic(at: file.path) == .readFailure)
+    let database = directory.appendingPathComponent("state.sqlite")
+    var handle: OpaquePointer?
+    precondition(sqlite3_open(database.path, &handle) == SQLITE_OK)
+    precondition(sqlite3_exec(handle, "CREATE TABLE threads (id TEXT, name TEXT, title TEXT, cwd TEXT, rollout_path TEXT, updated_at INTEGER, archived INTEGER)", nil, nil, nil) == SQLITE_OK)
+    let sql = "INSERT INTO threads VALUES ('trust-test','trust-test','trust-test','\(directory.path)','\(file.path)',\(Int(Date().timeIntervalSince1970)),0)"
+    precondition(sqlite3_exec(handle, sql, nil, nil, nil) == SQLITE_OK)
+    sqlite3_close(handle)
+    try started.write(to: file, atomically: true, encoding: .utf8)
+    let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
+    model.mergeCodex(CodexReader.sessions(databaseURL: database))
+    let child = model.tasks.first { $0.codexThreadID == "trust-test" }!
+    let activity = child.lastActivityAt
+    let validReady = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}"
+    let unknown = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_future_state\"}}"
+    for tail in [unknown, "{\"type\":\"event_msg\",\"payload\":"] {
+        try (validReady + "\n" + tail).write(to: file, atomically: true, encoding: .utf8)
+        let sessions = CodexReader.sessions(databaseURL: database)
+        precondition(sessions.count == 1 && !sessions[0].stateIsTrusted)
+        model.mergeCodex(sessions)
+        precondition(model.tasks.first { $0.id == child.id }!.state == .waiting)
+        precondition(model.tasks.first { $0.id == child.id }!.lastActivityAt == activity)
+    }
+    try (unknown + "\n" + validReady).write(to: file, atomically: true, encoding: .utf8)
+    let validAgain = CodexReader.sessions(databaseURL: database)
+    precondition(validAgain[0].stateIsTrusted && validAgain[0].state == .ready)
+    model.mergeCodex(validAgain)
+    precondition(model.tasks.first { $0.id == child.id }!.state == .ready)
+    let largePrefix = String(repeating: "{\"type\":\"session_meta\",\"payload\":{\"padding\":\"" + String(repeating: "x", count: 1024) + "\"}}\n", count: 20_000)
+    let tailUser = String(data: try JSONSerialization.data(withJSONObject: user), encoding: .utf8)!
+    try (largePrefix + tailUser + "\n" + validReady).write(to: file, atomically: true, encoding: .utf8)
+    precondition(CodexReader.recentActivity(at: file.path)?.0 == .ready)
+    precondition(CodexReader.scannedLineCount(at: file.path) <= 2)
+    let missing = directory.appendingPathComponent("missing.sqlite")
+    precondition(CodexReader.sessions(databaseURL: missing).isEmpty)
+    precondition(CodexReader.databaseDiagnostic(at: missing) == .readFailure)
+    print("Codex format and diagnostics self-test passed")
+} else if CommandLine.arguments.contains("--pinned-navigation-self-test") {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-navigation-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: directory) }
     let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
