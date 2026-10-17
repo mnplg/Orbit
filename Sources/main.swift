@@ -192,6 +192,7 @@ struct BoardTask: Identifiable, Codable {
     var isAutoGroup = false
     var groupingMode: GroupingMode = .auto
     var isTitleCustomized = false
+    var completionOverride = false
 
     var isConversation: Bool { cursorPath != nil || qoderSessionID != nil || codexThreadID != nil }
     var sourceName: String {
@@ -208,7 +209,7 @@ struct BoardTask: Identifiable, Codable {
     private enum CodingKeys: String, CodingKey {
         case id, title, nextStep, link, state, stateSince, createdAt
         case cursorPath, observedLines, qoderSessionID, qoderObservedLines, codexThreadID, lastUserPreview, parentID, boundParentIDs, projectKey
-        case lastActivityAt, isPinned, isAutoGroup, groupingMode, isTitleCustomized
+        case lastActivityAt, isPinned, isAutoGroup, groupingMode, isTitleCustomized, completionOverride
     }
 
     init(from decoder: Decoder) throws {
@@ -234,6 +235,7 @@ struct BoardTask: Identifiable, Codable {
         groupingMode = try values.decodeIfPresent(GroupingMode.self, forKey: .groupingMode)
             ?? (parentID == nil && !boundParentIDs.isEmpty ? .manual : .auto)
         isTitleCustomized = try values.decodeIfPresent(Bool.self, forKey: .isTitleCustomized) ?? false
+        completionOverride = try values.decodeIfPresent(Bool.self, forKey: .completionOverride) ?? false
         let legacyProjectName = projectKey.map { URL(fileURLWithPath: $0).lastPathComponent }
         isAutoGroup = try values.decodeIfPresent(Bool.self, forKey: .isAutoGroup)
             ?? (parentID == nil && !isConversation && projectKey != nil &&
@@ -877,13 +879,8 @@ final class BoardModel: ObservableObject {
     }
 
     func setState(_ id: UUID, to state: TaskState) {
-        if state == .done, let task = tasks.first(where: { $0.id == id }), !task.isConversation {
-            for index in tasks.indices where tasks[index].parentID == id {
-                tasks[index].state = .done
-                tasks[index].stateSince = Date()
-            }
-        }
         update(id) { task in
+            if !task.isConversation { task.completionOverride = state == .done }
             guard task.state != state else { return }
             task.state = state
             task.stateSince = Date()
@@ -1190,6 +1187,7 @@ final class BoardModel: ObservableObject {
     }
 
     func displayState(for task: BoardTask) -> TaskState {
+        if !task.isConversation && task.completionOverride { return .done }
         let children = visibleChildren(of: task.id).filter { $0.state != .done }
         if children.contains(where: { $0.state == .human }) { return .human }
         if task.state == .human { return .human }
@@ -1939,6 +1937,9 @@ struct TaskCard: View {
 
     private var taskMenu: some View {
         VStack(alignment: .leading, spacing: 3) {
+            if !task.isConversation && task.completionOverride {
+                Button("重新打开主体") { model.setState(task.id, to: .working); menuOpen = false }
+            }
             ForEach(TaskState.allCases) { state in
                 Button("标记为\(state.rawValue)") { model.setState(task.id, to: state); menuOpen = false }
             }
@@ -2432,7 +2433,38 @@ func runPersistenceSelfTest() throws {
     print("Persistence recovery self-test passed")
 }
 
-if CommandLine.arguments.contains("--grouping-intent-self-test") {
+if CommandLine.arguments.contains("--completion-override-self-test") {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-completion-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
+    let session = CodexSession(id: "shared-session", title: "共享会话", lastUserPreview: "合成输入", state: .waiting,
+                               modified: Date(), projectKey: directory.path, projectTitle: "project")
+    model.mergeCodex([session])
+    let child = model.tasks.first { $0.codexThreadID == session.id }!
+    let primary = model.tasks.first { $0.isAutoGroup }!
+    model.add("共享主体B")
+    let extra = model.tasks.first { $0.title == "共享主体B" }!
+    model.bindSession(child.id, to: extra.id)
+    for parentID in [primary.id, extra.id] {
+        model.setState(parentID, to: .done)
+        let closed = model.tasks.first { $0.id == parentID }!
+        precondition(model.displayState(for: closed) == .done)
+        precondition(model.completed.contains { $0.id == parentID })
+        precondition(model.tasks.first { $0.id == child.id }!.state == .waiting)
+        let other = model.tasks.first { $0.id == (parentID == primary.id ? extra.id : primary.id) }!
+        precondition(model.displayState(for: other) == .waiting)
+        let newer = CodexSession(id: session.id, title: session.title, lastUserPreview: "新合成活动", state: .human,
+                                 modified: Date().addingTimeInterval(1), projectKey: directory.path, projectTitle: "project")
+        model.mergeCodex([newer])
+        precondition(model.displayState(for: model.tasks.first { $0.id == parentID }!) == .done)
+        let restored = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
+        precondition(restored.displayState(for: restored.tasks.first { $0.id == parentID }!) == .done)
+        model.setState(parentID, to: .working)
+        precondition(model.displayState(for: model.tasks.first { $0.id == parentID }!) == .human)
+        model.setState(child.id, to: .waiting)
+    }
+    print("Completion override self-test passed")
+} else if CommandLine.arguments.contains("--grouping-intent-self-test") {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-intent-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: directory) }
     let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
