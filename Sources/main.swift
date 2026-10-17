@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import SQLite3
 import SwiftUI
 
@@ -170,7 +171,7 @@ enum HumanActionDetector {
 
 enum GroupingMode: String, Codable { case auto, manual, detached }
 
-struct BoardTask: Identifiable, Codable {
+struct BoardTask: Identifiable, Codable, Equatable {
     var id = UUID()
     var title: String
     var nextStep = ""
@@ -262,10 +263,21 @@ enum CursorReader {
     static func lines(at path: String) -> [[String: Any]] {
         SyntheticAccess.check(URL(fileURLWithPath: path))
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-              let text = String(data: data, encoding: .utf8) else { return [] }
-        return text.split(separator: "\n").compactMap { line in
-            guard let data = line.data(using: .utf8) else { return nil }
-            return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+              String(data: data, encoding: .utf8) != nil else { return [] }
+        return data.withUnsafeBytes { raw -> [[String: Any]] in
+            guard let base = raw.baseAddress else { return [] }
+            var result: [[String: Any]] = []
+            var start = 0
+            while start < raw.count {
+                let delimiter = memchr(base.advanced(by: start), 10, raw.count - start)
+                let end = delimiter.map { base.distance(to: $0) } ?? raw.count
+                if end > start {
+                    let row = Data(bytes: base.advanced(by: start), count: end - start)
+                    if let object = (try? JSONSerialization.jsonObject(with: row)) as? [String: Any] { result.append(object) }
+                }
+                start = end + 1
+            }
+            return result
         }
     }
 
@@ -759,9 +771,59 @@ struct BoardSources {
     }
 }
 
+struct CursorObservation {
+    let count: Int
+    let state: TaskState
+    let modified: Date
+}
+
+struct BoardPollRequest {
+    let cursorRoot: URL
+    let cursorPaths: [String]
+    let qoderRoot: URL
+    let hookURL: URL
+    let codexDatabase: URL
+}
+
+struct BoardPollSnapshot {
+    var cursor: [CursorSession] = []
+    var cursorObservations: [String: CursorObservation] = [:]
+    var qoder: [QoderSession] = []
+    var hookEvents: [[String: Any]] = []
+    var codex: [CodexSession] = []
+}
+
+struct BoardPollTicket {
+    let generation: UInt64
+    let revision: UInt64
+}
+
+struct BoardPollMetrics {
+    let readMilliseconds: Double
+    let mergeMilliseconds: Double
+    let savedSnapshots: Int
+}
+
 final class BoardModel: ObservableObject {
-    @Published var tasks: [BoardTask] = [] {
-        didSet { save() }
+    @Published private var storedTasks: [BoardTask] = []
+    private var batchTasks: [BoardTask]?
+    var tasks: [BoardTask] {
+        get { batchTasks ?? storedTasks }
+        set {
+            if batchDepth > 0 { batchTasks = newValue; return }
+            guard newValue != storedTasks else { return }
+            storedTasks = newValue
+            if !loading { revision &+= 1; save() }
+        }
+        _modify {
+            if batchDepth > 0 {
+                yield &batchTasks!
+            } else {
+                var updated = storedTasks
+                defer { tasks = updated }
+                yield &updated
+            }
+        }
     }
     @Published private(set) var codexRecentThreads: [CodexRecentThread] = []
     @Published private(set) var isLoadingCodexRecent = false
@@ -771,6 +833,20 @@ final class BoardModel: ObservableObject {
     private let qoderEventsURL: URL
     private let sources: BoardSources
     private var loading = true
+    private var revision: UInt64 = 0
+    private var persistedTasks: [BoardTask]?
+    private var knownValidMainData: Data?
+    private var encodedTasks: [UUID: (task: BoardTask, data: Data)] = [:]
+    private(set) var lastSaveMilliseconds = 0.0
+    private(set) var lastSavePhaseMilliseconds: [String: Double] = [:]
+    private var batchDepth = 0
+    private var pendingSave = false
+    private var pollGeneration: UInt64 = 0
+    private(set) var isPolling = false
+    private(set) var skippedPolls = 0
+    private(set) var discardedPolls = 0
+    private(set) var savedSnapshotCount = 0
+    private(set) var lastPollMetrics: BoardPollMetrics?
     private var loadBlocked = false
     private var loadedSnapshot = false
     /// Test adapter throws before each filesystem mutation; production uses no adapter.
@@ -794,6 +870,7 @@ final class BoardModel: ObservableObject {
             let backup = try? Data(contentsOf: support.appendingPathComponent("tasks.json.bak"))
             let saved = main.flatMap { try? JSONDecoder().decode([BoardTask].self, from: $0) }
             let recovered = backup.flatMap { try? JSONDecoder().decode([BoardTask].self, from: $0) }
+            if saved != nil { knownValidMainData = main }
             if mainExists && saved == nil {
                 try storageFault?("quarantine")
                 try FileManager.default.copyItem(at: fileURL, to: support.appendingPathComponent("tasks-unreadable-" + UUID().uuidString + ".json"))
@@ -823,6 +900,7 @@ final class BoardModel: ObservableObject {
             persistenceError = "无法加载任务：\(error.localizedDescription)"
         }
         loading = false
+        if persistenceError == nil { persistedTasks = tasks }
     }
 
     func retrySave() {
@@ -836,6 +914,7 @@ final class BoardModel: ObservableObject {
                 let main = try? Data(contentsOf: fileURL)
                 let saved = main.flatMap { try? JSONDecoder().decode([BoardTask].self, from: $0) }
                 let recovered = (try? Data(contentsOf: backup)).flatMap { try? JSONDecoder().decode([BoardTask].self, from: $0) }
+                if saved != nil { knownValidMainData = main }
                 if exists && saved == nil {
                     try storageFault?("quarantine")
                     try FileManager.default.copyItem(at: fileURL, to: directory.appendingPathComponent("tasks-unreadable-" + UUID().uuidString + ".json"))
@@ -867,30 +946,159 @@ final class BoardModel: ObservableObject {
         save()
     }
 
+    private func encodedTaskSnapshot() throws -> Data {
+        let encoder = JSONEncoder()
+        var result = Data([91])
+        var nextCache: [UUID: (task: BoardTask, data: Data)] = [:]
+        for (index, task) in tasks.enumerated() {
+            let encoded: Data
+            if let cached = encodedTasks[task.id], cached.task == task { encoded = cached.data }
+            else { encoded = try encoder.encode(task) }
+            if index > 0 { result.append(44) }
+            result.append(encoded)
+            nextCache[task.id] = (task, encoded)
+        }
+        result.append(93)
+        encodedTasks = nextCache // Keep only currently present IDs; this cache is not a persisted-state marker.
+        return result
+    }
+
+    private func rotateBackup(_ data: Data, to backup: URL) throws {
+        let staged = backup.deletingLastPathComponent().appendingPathComponent("tasks-backup-stage-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: staged) }
+        try data.write(to: staged)
+        try storageFault?("backupReplace")
+        guard Darwin.rename(staged.path, backup.path) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+    }
+
     private func save() {
         guard !loading, !loadBlocked else { return }
+        if batchDepth > 0 { pendingSave = true; return }
+        guard persistedTasks != tasks else { return }
+        let saveStarted = Date()
+        var phaseStarted = saveStarted
+        lastSavePhaseMilliseconds = [:]
+        func phase(_ name: String) {
+            let now = Date(); lastSavePhaseMilliseconds[name] = now.timeIntervalSince(phaseStarted) * 1000; phaseStarted = now
+        }
+        defer { lastSaveMilliseconds = Date().timeIntervalSince(saveStarted) * 1000 }
         let backup = fileURL.deletingLastPathComponent().appendingPathComponent("tasks.json.bak")
         do {
-            let data = try JSONEncoder().encode(tasks)
+            let data = try encodedTaskSnapshot()
+            phase("encode")
             let previous = try? Data(contentsOf: fileURL)
-            let validPrevious = previous.flatMap { try? JSONDecoder().decode([BoardTask].self, from: $0) } != nil
+            let validPrevious = previous != nil && (previous == knownValidMainData || previous.flatMap { try? JSONDecoder().decode([BoardTask].self, from: $0) } != nil)
+            phase("read_validate_previous")
             try storageFault?("write")
             // Stage the complete new snapshot before touching either existing copy.
             let staged = fileURL.deletingLastPathComponent().appendingPathComponent("tasks-stage-" + UUID().uuidString)
             defer { try? FileManager.default.removeItem(at: staged) }
-            try data.write(to: staged, options: .atomic)
+            try data.write(to: staged)
+            phase("stage")
             try storageFault?("replace")
-            // Atomic write preserves the existing main on failure. Keep bak until this succeeds.
-            try data.write(to: fileURL, options: .atomic)
+            // Both paths share a directory/filesystem; rename atomically replaces the main.
+            guard Darwin.rename(staged.path, fileURL.path) == 0 else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+            }
+            knownValidMainData = data
+            phase("replace")
             if validPrevious, let previous {
                 try storageFault?("backupRotate")
-                try previous.write(to: backup, options: .atomic)
+                try rotateBackup(previous, to: backup)
             } else if !FileManager.default.fileExists(atPath: backup.path) {
                 try storageFault?("backupRotate")
-                try data.write(to: backup, options: .atomic)
+                try rotateBackup(data, to: backup)
             }
+            phase("backup")
+            persistedTasks = tasks
+            savedSnapshotCount += 1
             persistenceError = nil
         } catch { persistenceError = "任务尚未保存：\(error.localizedDescription)" }
+    }
+
+    func performBatch(_ operation: () -> Void) {
+        if batchDepth == 0 { batchTasks = storedTasks }
+        batchDepth += 1
+        defer {
+            batchDepth -= 1
+            if batchDepth == 0 {
+                let updated = batchTasks!
+                batchTasks = nil
+                pendingSave = false
+                tasks = updated
+            }
+        }
+        operation()
+    }
+
+    static func readPollSnapshot(_ request: BoardPollRequest) -> BoardPollSnapshot {
+        precondition(!Thread.isMainThread, "Scheduled source reads must run in the background")
+        let cursor = CursorReader.sessions(root: request.cursorRoot)
+        var observations = Dictionary(uniqueKeysWithValues: cursor.map {
+            ($0.path, CursorObservation(count: $0.lineCount, state: $0.state, modified: $0.modified))
+        })
+        // Legacy bound paths can live outside the current project index. Read each missing path once.
+        for path in Set(request.cursorPaths) where observations[path] == nil {
+            let events = CursorReader.lines(at: path)
+            let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+            observations[path] = CursorObservation(count: events.count, state: CursorReader.inferredState(in: events),
+                                                   modified: attributes?[.modificationDate] as? Date ?? .distantPast)
+        }
+        return BoardPollSnapshot(cursor: cursor, cursorObservations: observations,
+                                 qoder: QoderReader.sessions(root: request.qoderRoot),
+                                 hookEvents: CursorReader.lines(at: request.hookURL.path),
+                                 codex: CodexReader.sessions(databaseURL: request.codexDatabase))
+    }
+
+    func beginPoll() -> BoardPollTicket? {
+        precondition(Thread.isMainThread)
+        guard !isPolling else { skippedPolls += 1; return nil }
+        isPolling = true
+        pollGeneration &+= 1
+        return BoardPollTicket(generation: pollGeneration, revision: revision)
+    }
+
+    func cancelPoll() {
+        precondition(Thread.isMainThread)
+        pollGeneration &+= 1
+        isPolling = false
+    }
+
+    @discardableResult
+    func commitPollSnapshot(_ snapshot: BoardPollSnapshot, ticket: BoardPollTicket, readMilliseconds: Double = 0) -> Bool {
+        precondition(Thread.isMainThread)
+        guard ticket.generation == pollGeneration else { discardedPolls += 1; return false }
+        defer { isPolling = false }
+        guard ticket.revision == revision else { discardedPolls += 1; return false }
+        let started = Date()
+        let savesBefore = savedSnapshotCount
+        performBatch {
+            mergeCursor(snapshot.cursor, observations: snapshot.cursorObservations)
+            mergeQoderEvents(snapshot.hookEvents, defaults: sources.defaults)
+            mergeQoderTranscripts(snapshot.qoder)
+            mergeCodex(snapshot.codex)
+        }
+        lastPollMetrics = BoardPollMetrics(readMilliseconds: readMilliseconds,
+                                          mergeMilliseconds: Date().timeIntervalSince(started) * 1000,
+                                          savedSnapshots: savedSnapshotCount - savesBefore)
+        return true
+    }
+
+    func pollInBackground() {
+        guard let ticket = beginPoll() else { return }
+        let request = BoardPollRequest(cursorRoot: sources.cursorRoot, cursorPaths: tasks.compactMap(\.cursorPath),
+                                       qoderRoot: sources.qoderRoot, hookURL: qoderEventsURL,
+                                       codexDatabase: sources.codexDatabase)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let start = Date()
+            let snapshot = Self.readPollSnapshot(request)
+            let duration = Date().timeIntervalSince(start) * 1000
+            DispatchQueue.main.async { [weak self] in
+                self?.commitPollSnapshot(snapshot, ticket: ticket, readMilliseconds: duration)
+            }
+        }
     }
 
     func add(_ title: String) {
@@ -1280,27 +1488,32 @@ final class BoardModel: ObservableObject {
     }
 
     func pollCursor() {
-        let sessions = Dictionary(uniqueKeysWithValues: CursorReader.sessions(root: sources.cursorRoot).map { ($0.path, $0) })
+        let sessions = CursorReader.sessions(root: sources.cursorRoot)
+        var observations = Dictionary(uniqueKeysWithValues: sessions.map {
+            ($0.path, CursorObservation(count: $0.lineCount, state: $0.state, modified: $0.modified))
+        })
+        for path in Set(tasks.compactMap(\.cursorPath)) where observations[path] == nil {
+            let events = CursorReader.lines(at: path)
+            observations[path] = CursorObservation(count: events.count, state: CursorReader.inferredState(in: events), modified: Date())
+        }
+        performBatch { mergeCursor(sessions, observations: observations) }
+    }
+
+    private func mergeCursor(_ incoming: [CursorSession], observations: [String: CursorObservation]) {
+        let sessions = Dictionary(uniqueKeysWithValues: incoming.map { ($0.path, $0) })
         for task in tasks where task.cursorPath != nil {
             guard let path = task.cursorPath, let session = sessions[path] else { continue }
-            if task.lastUserPreview != session.lastUserPreview {
-                update(task.id) { $0.lastUserPreview = session.lastUserPreview }
-            }
-            if task.projectKey != session.projectKey {
-                update(task.id) { $0.projectKey = session.projectKey }
-            }
+            if task.lastUserPreview != session.lastUserPreview { update(task.id) { $0.lastUserPreview = session.lastUserPreview } }
+            if task.projectKey != session.projectKey { update(task.id) { $0.projectKey = session.projectKey } }
             ensureProjectParent(for: task.id, key: session.projectKey, title: session.projectTitle)
         }
         for index in tasks.indices {
-            guard let path = tasks[index].cursorPath else { continue }
-            let events = CursorReader.lines(at: path)
-            let oldCount = tasks[index].observedLines
-            guard events.count > oldCount else { continue }
-            let nextState = CursorReader.inferredState(in: events)
-            tasks[index].observedLines = events.count
-            tasks[index].lastActivityAt = min(sessions[path]?.modified ?? Date(), Date())
-            if tasks[index].state != .done, tasks[index].state != nextState {
-                tasks[index].state = nextState
+            guard let path = tasks[index].cursorPath, let observation = observations[path],
+                  observation.count > tasks[index].observedLines else { continue }
+            tasks[index].observedLines = observation.count
+            tasks[index].lastActivityAt = min(observation.modified, Date())
+            if tasks[index].state != .done && tasks[index].state != observation.state {
+                tasks[index].state = observation.state
                 tasks[index].stateSince = Date()
             }
         }
@@ -1309,6 +1522,10 @@ final class BoardModel: ObservableObject {
     func pollQoder(defaults suppliedDefaults: UserDefaults? = nil) {
         let defaults = suppliedDefaults ?? sources.defaults
         let events = CursorReader.lines(at: qoderEventsURL.path)
+        performBatch { mergeQoderEvents(events, defaults: defaults) }
+    }
+
+    private func mergeQoderEvents(_ events: [[String: Any]], defaults: UserDefaults) {
         let savedCount = defaults.integer(forKey: "qoderEventLineCount")
         let oldCount = events.count < savedCount ? 0 : savedCount
         guard events.count > oldCount else { return }
@@ -1361,41 +1578,62 @@ final class BoardModel: ObservableObject {
 
     func pollQoderTranscripts(root suppliedRoot: URL? = nil) {
         let root = suppliedRoot ?? sources.qoderRoot
-        for session in QoderReader.sessions(root: root) {
-            if let existing = tasks.firstIndex(where: { $0.qoderSessionID == session.id }) {
-                let childID = tasks[existing].id
-                if tasks[existing].projectKey != session.projectKey {
-                    tasks[existing].projectKey = session.projectKey
-                }
-                ensureProjectParent(for: childID, key: session.projectKey, title: session.projectTitle)
-                guard let index = tasks.firstIndex(where: { $0.id == childID }) else { continue }
-                if tasks[index].lastUserPreview != session.lastUserPreview {
-                    tasks[index].lastUserPreview = session.lastUserPreview
-                }
-                let hasNewPrompt = session.lastPromptAt.map { $0 > tasks[index].stateSince } ?? false
-                let missedInterruption = session.wasInterrupted && tasks[index].state == .waiting
-                    && tasks[index].lastActivityAt <= session.modified
-                guard session.lineCount != tasks[index].qoderObservedLines
-                        || (tasks[index].state == .done && hasNewPrompt) || missedInterruption else { continue }
-                tasks[index].qoderObservedLines = session.lineCount
-                tasks[index].lastActivityAt = min(session.modified, Date())
-                if (tasks[index].state != .done || hasNewPrompt), tasks[index].state != session.state {
-                    tasks[index].state = session.state
-                    tasks[index].stateSince = Date()
+        let sessions = QoderReader.sessions(root: root)
+        performBatch { mergeQoderTranscripts(sessions) }
+    }
+
+    private func mergeQoderTranscripts(_ sessions: [QoderSession]) {
+        guard !sessions.isEmpty else { return }
+        var rows = tasks
+        let originalCount = rows.count
+        var bySession: [String: Int] = [:]
+        var byID: [UUID: Int] = [:]
+        var automatic: [String: UUID] = [:]
+        for index in rows.indices {
+            byID[rows[index].id] = index
+            if let sessionID = rows[index].qoderSessionID, bySession[sessionID] == nil { bySession[sessionID] = index }
+            if rows[index].isAutoGroup && !rows[index].isConversation, let key = rows[index].projectKey,
+               automatic[key] == nil { automatic[key] = rows[index].id }
+        }
+        func ensureParent(_ index: Int, key: String) {
+            guard !key.isEmpty && rows[index].groupingMode == .auto else { return }
+            if let parentID = rows[index].parentID, let parentIndex = byID[parentID], !rows[parentIndex].isAutoGroup { return }
+            let parentID: UUID
+            if let existing = automatic[key] { parentID = existing }
+            else {
+                var parent = BoardTask(title: URL(fileURLWithPath: key).lastPathComponent)
+                parent.projectKey = key; parent.isAutoGroup = true
+                parentID = parent.id
+                byID[parentID] = rows.count; automatic[key] = parentID; rows.append(parent)
+            }
+            rows[index].parentID = parentID
+        }
+        let now = Date()
+        for session in sessions {
+            let index: Int
+            if let existing = bySession[session.id] {
+                index = existing
+                rows[index].projectKey = session.projectKey
+                rows[index].lastUserPreview = session.lastUserPreview
+                ensureParent(index, key: session.projectKey)
+                let hasNewPrompt = session.lastPromptAt.map { $0 > rows[index].stateSince } ?? false
+                let missedInterruption = session.wasInterrupted && rows[index].state == .waiting && rows[index].lastActivityAt <= session.modified
+                guard session.lineCount != rows[index].qoderObservedLines || (rows[index].state == .done && hasNewPrompt) || missedInterruption else { continue }
+                rows[index].qoderObservedLines = session.lineCount
+                rows[index].lastActivityAt = min(session.modified, now)
+                if (rows[index].state != .done || hasNewPrompt) && rows[index].state != session.state {
+                    rows[index].state = session.state; rows[index].stateSince = now
                 }
             } else {
                 var task = BoardTask(title: session.title)
-                task.qoderSessionID = session.id
-                task.lastUserPreview = session.lastUserPreview
-                task.projectKey = session.projectKey
-                task.qoderObservedLines = session.lineCount
-                task.state = session.state
-                task.stateSince = session.modified
-                task.lastActivityAt = min(session.modified, Date())
-                tasks.insert(task, at: 0)
-                ensureProjectParent(for: task.id, key: session.projectKey, title: session.projectTitle)
+                task.qoderSessionID = session.id; task.lastUserPreview = session.lastUserPreview
+                task.projectKey = session.projectKey; task.qoderObservedLines = session.lineCount
+                task.state = session.state; task.stateSince = session.modified; task.lastActivityAt = min(session.modified, now)
+                index = rows.count; bySession[session.id] = index; byID[task.id] = index; rows.append(task)
+                ensureParent(index, key: session.projectKey)
             }
         }
+        tasks = Array(rows.dropFirst(originalCount).reversed()) + Array(rows.prefix(originalCount))
     }
 
     func mergeCodex(_ sessions: [CodexSession]) {
@@ -2321,7 +2559,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var panel: NSPanel!
     private var statusItem: NSStatusItem!
     private var pollTimer: Timer?
-    private var codexPollInFlight = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -2373,27 +2610,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         for item in menu.items { item.target = self }
         statusItem.menu = menu
         pollTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            self?.model.pollCursor()
-            self?.model.pollQoder()
-            self?.model.pollQoderTranscripts()
-            self?.pollCodex()
+            self?.model.pollInBackground()
         }
-        model.pollQoder()
-        model.pollQoderTranscripts()
-        model.pollCursor()
-        pollCodex()
-    }
-
-    private func pollCodex() {
-        guard !codexPollInFlight else { return }
-        codexPollInFlight = true
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let sessions = CodexReader.sessions()
-            DispatchQueue.main.async { [weak self] in
-                self?.model.mergeCodex(sessions)
-                self?.codexPollInFlight = false
-            }
-        }
+        model.pollInBackground()
     }
 
     @objc private func showBoard() {
@@ -2432,7 +2651,7 @@ func runPersistenceSelfTest() throws {
     model.add("第三项"); model.add("第四项")
     precondition(try! JSONDecoder().decode([BoardTask].self, from: Data(contentsOf: backup)).count == 3)
     precondition(try! JSONDecoder().decode([BoardTask].self, from: Data(contentsOf: main)).count == 4)
-    for stage in ["write", "replace", "backupRotate"] {
+    for stage in ["write", "replace", "backupRotate", "backupReplace"] {
         var fail = false
         let tested = BoardModel(dataDirectory: directory, sources: .synthetic(directory), storageFault: { point in
             if fail && point == stage { throw NSError(domain: "SyntheticStorage", code: 1) }
@@ -2495,7 +2714,103 @@ func runPersistenceSelfTest() throws {
     print("Persistence recovery self-test passed")
 }
 
-if CommandLine.arguments.contains("--codex-format-self-test") {
+if CommandLine.arguments.contains("--poll-snapshot-self-test") {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-poll-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
+    model.add("Synthetic owner")
+    let parent = model.tasks[0]
+    let source = CodexSession(id: "poll-thread", title: "Synthetic session", lastUserPreview: "fixture", state: .waiting,
+                              modified: Date(), projectKey: directory.path, projectTitle: "project")
+    let snapshot = BoardPollSnapshot(codex: [source])
+    let ticket = model.beginPoll()!
+    precondition(model.beginPoll() == nil && model.skippedPolls == 1)
+    let before = model.savedSnapshotCount
+    precondition(model.commitPollSnapshot(snapshot, ticket: ticket))
+    precondition(model.savedSnapshotCount == before + 1 && model.lastPollMetrics!.savedSnapshots == 1)
+    let unchanged = model.beginPoll()!
+    precondition(model.commitPollSnapshot(snapshot, ticket: unchanged))
+    precondition(model.lastPollMetrics!.savedSnapshots == 0)
+    let child = model.tasks.first { $0.codexThreadID == source.id }!
+    for action in 0..<4 {
+        let stale = model.beginPoll()!
+        switch action {
+        case 0: model.renameTask(parent.id, to: "Edited while reading")
+        case 1: model.assignParent(child.id, to: nil)
+        case 2: model.bindSession(child.id, to: parent.id); model.unbindSession(child.id, from: parent.id)
+        default: model.remove(child.id)
+        }
+        let memory = model.tasks
+        let saves = model.savedSnapshotCount
+        precondition(!model.commitPollSnapshot(snapshot, ticket: stale))
+        precondition(model.tasks == memory && model.savedSnapshotCount == saves)
+    }
+    let oldGeneration = model.beginPoll()!
+    model.cancelPoll()
+    let currentGeneration = model.beginPoll()!
+    precondition(!model.commitPollSnapshot(snapshot, ticket: oldGeneration) && model.isPolling)
+    precondition(model.commitPollSnapshot(BoardPollSnapshot(), ticket: currentGeneration))
+    model.pollInBackground()
+    let deadline = Date().addingTimeInterval(5)
+    while model.isPolling && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+    precondition(!model.isPolling)
+    print("Background poll snapshot and batching self-test passed")
+} else if CommandLine.arguments.contains("--poll-performance-self-test") {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-poll-perf-" + UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let logs = directory.appendingPathComponent("qoder")
+    let project = logs.appendingPathComponent("synthetic-project")
+    try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+    let padding = String(repeating: "x", count: 10480)
+    let filler = try JSONSerialization.data(withJSONObject: ["type": "metadata", "padding": padding])
+    for index in 0..<100 {
+        let user: [String: Any] = ["sessionId": "synthetic-\(index)", "cwd": "/synthetic/project-\(index)", "type": "user",
+                                   "message": ["content": [["type": "text", "text": "Synthetic prompt \(index)"]]]]
+        var data = try JSONSerialization.data(withJSONObject: user); data.append(10)
+        for _ in 0..<100 { data.append(filler); data.append(10) }
+        try data.write(to: project.appendingPathComponent("\(index).jsonl"))
+    }
+    let fixtureSources = BoardSources(cursorRoot: directory.appendingPathComponent("cursor"), qoderRoot: logs,
+                                     codexDatabase: directory.appendingPathComponent("missing.sqlite"), defaults: BoardSources.synthetic(directory).defaults)
+    let model = BoardModel(dataDirectory: directory.appendingPathComponent("storage"), sources: fixtureSources)
+    var tasks: [BoardTask] = []
+    for index in 0..<100 {
+        var parent = BoardTask(title: "Project \(index)"); parent.isAutoGroup = true; parent.projectKey = "/synthetic/project-\(index)"
+        var child = BoardTask(title: "Synthetic prompt \(index)"); child.qoderSessionID = "synthetic-\(index)"; child.projectKey = parent.projectKey; child.parentID = parent.id
+        tasks += [parent, child]
+    }
+    model.tasks = tasks
+    var reads: [Double] = [], merges: [Double] = [], saves: [Int] = [], persistence: [Double] = [], phases: [[String: Double]] = []
+    for _ in 0..<5 {
+        model.performBatch {
+            for index in model.tasks.indices where model.tasks[index].isConversation {
+                model.tasks[index].qoderObservedLines = 0; model.tasks[index].state = .ready
+            }
+        }
+        let request = BoardPollRequest(cursorRoot: fixtureSources.cursorRoot, cursorPaths: [], qoderRoot: logs,
+                                       hookURL: directory.appendingPathComponent("empty-hook.jsonl"), codexDatabase: fixtureSources.codexDatabase)
+        let semaphore = DispatchSemaphore(value: 0)
+        var snapshot = BoardPollSnapshot()
+        var readTime = 0.0
+        DispatchQueue.global(qos: .utility).async {
+            let start = Date(); snapshot = BoardModel.readPollSnapshot(request)
+            readTime = Date().timeIntervalSince(start) * 1000; semaphore.signal()
+        }
+        semaphore.wait() // This synthetic CLI harness measures the background phase separately.
+        let ticket = model.beginPoll()!
+        precondition(model.commitPollSnapshot(snapshot, ticket: ticket, readMilliseconds: readTime))
+        reads.append(readTime); merges.append(model.lastPollMetrics!.mergeMilliseconds); saves.append(model.lastPollMetrics!.savedSnapshots); persistence.append(model.lastSaveMilliseconds); phases.append(model.lastSavePhaseMilliseconds)
+        precondition(model.tasks.count == 200 && model.lastPollMetrics!.savedSnapshots == 1)
+    }
+    let ordered = merges.sorted(); let p95 = ordered.last!
+    let output: [String: Any] = ["build": "swiftc debug", "fixture": "100 logs ~1MB each,200 tasks,5 changed polls", "background_read_ms": reads,
+                                  "main_merge_ms": merges, "save_calls": saves, "persistence_ms": persistence, "save_phase_ms": phases, "p95_merge_ms": p95, "longest_merge_ms": ordered.last!]
+    print(String(data: try JSONSerialization.data(withJSONObject: output, options: [.prettyPrinted, .sortedKeys]), encoding: .utf8)!)
+    fflush(stdout)
+    precondition(p95 <= 16 && ordered.last! <= 50 && zip(reads, merges).allSatisfy { $0 + $1 < 5000 })
+    print("Background poll performance self-test passed")
+} else if CommandLine.arguments.contains("--codex-format-self-test") {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-format-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
