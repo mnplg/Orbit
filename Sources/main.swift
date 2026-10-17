@@ -251,6 +251,7 @@ enum CursorReader {
         .appendingPathComponent(".cursor/projects", isDirectory: true)
 
     static func lines(at path: String) -> [[String: Any]] {
+        SyntheticAccess.check(URL(fileURLWithPath: path))
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let text = String(data: data, encoding: .utf8) else { return [] }
         return text.split(separator: "\n").compactMap { line in
@@ -293,22 +294,25 @@ enum CursorReader {
         return HumanActionDetector.needsHuman(finalReply) ? .human : .ready
     }
 
-    static func sessions() -> [CursorSession] {
+    static func sessions(root: URL = root) -> [CursorSession] {
+        SyntheticAccess.check(root)
         guard let projects = try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else { return [] }
         var found: [CursorSession] = []
         for project in projects {
             let transcripts = project.appendingPathComponent("agent-transcripts", isDirectory: true)
+            SyntheticAccess.check(transcripts)
             let projectName = project.lastPathComponent
             let decodedPath = "/" + projectName.replacingOccurrences(of: "-", with: "/")
-            let projectKey = FileManager.default.fileExists(atPath: decodedPath)
+            let projectKey = SyntheticAccess.exists(decodedPath)
                 ? URL(fileURLWithPath: decodedPath).standardizedFileURL.path
                 : project.standardizedFileURL.path
-            let projectTitle = FileManager.default.fileExists(atPath: decodedPath)
+            let projectTitle = SyntheticAccess.exists(decodedPath)
                 ? URL(fileURLWithPath: decodedPath).lastPathComponent
                 : (projectName.split(separator: "-").last.map(String.init) ?? "Cursor 项目")
             guard let agents = try? FileManager.default.contentsOfDirectory(at: transcripts, includingPropertiesForKeys: nil) else { continue }
             for agent in agents {
                 let file = agent.appendingPathComponent(agent.lastPathComponent + ".jsonl")
+                SyntheticAccess.check(file)
                 guard FileManager.default.fileExists(atPath: file.path) else { continue }
                 let events = lines(at: file.path)
                 guard let firstUser = events.first(where: { !userText(in: $0).isEmpty }) else { continue }
@@ -354,11 +358,14 @@ enum QoderReader {
     }
 
     static func sessions(root: URL = root) -> [QoderSession] {
+        SyntheticAccess.check(root)
         guard let projects = try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else { return [] }
         var found: [QoderSession] = []
         for project in projects {
+            SyntheticAccess.check(project)
             guard let files = try? FileManager.default.contentsOfDirectory(at: project, includingPropertiesForKeys: nil) else { continue }
             for file in files where file.pathExtension == "jsonl" {
+                SyntheticAccess.check(file)
                 let attrs = try? FileManager.default.attributesOfItem(atPath: file.path)
                 let modified = attrs?[.modificationDate] as? Date ?? .distantPast
                 guard modified > Date().addingTimeInterval(-7 * 24 * 3600) else { continue }
@@ -443,6 +450,8 @@ enum CodexReader {
         .appendingPathComponent(".codex/state_5.sqlite")
 
     static func recentThreads(databaseURL: URL = databaseURL) -> [CodexRecentThread] {
+        SyntheticAccess.check(databaseURL)
+        SyntheticAccess.check(databaseURL)
         var database: OpaquePointer?
         guard sqlite3_open_v2(databaseURL.path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
               let database else {
@@ -482,6 +491,7 @@ enum CodexReader {
     }
 
     static func recentActivity(at path: String) -> (TaskState, String)? {
+        SyntheticAccess.check(URL(fileURLWithPath: path))
         guard FileManager.default.fileExists(atPath: path) else { return nil }
         let activity = latestActivity(at: path)
         return (activity.state, activity.lastUserPreview)
@@ -500,6 +510,7 @@ enum CodexReader {
     private static var stateCache: [String: CachedState] = [:]
 
     static func sessions(databaseURL: URL = databaseURL, now: Date = Date()) -> [CodexSession] {
+        SyntheticAccess.check(databaseURL)
         var database: OpaquePointer?
         guard sqlite3_open_v2(databaseURL.path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
               let database else {
@@ -547,6 +558,7 @@ enum CodexReader {
     }
 
     private static func latestActivity(at path: String) -> Activity {
+        SyntheticAccess.check(URL(fileURLWithPath: path))
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
               let size = attrs[.size] as? Int,
               let modified = attrs[.modificationDate] as? Date else {
@@ -660,6 +672,44 @@ enum CodexReader {
     }
 }
 
+enum SyntheticAccess {
+    static func check(_ url: URL) {
+        if let root = ProcessInfo.processInfo.environment["ORBIT_SYNTHETIC_ROOT"] {
+            let path = url.standardizedFileURL.resolvingSymlinksInPath().path
+            let allowed = URL(fileURLWithPath: root).standardizedFileURL.resolvingSymlinksInPath().path
+            precondition(path == allowed || path.hasPrefix(allowed + "/"), "Synthetic reader escaped fixture root")
+        }
+    }
+    static func exists(_ path: String) -> Bool {
+        // Decoded Cursor project paths are metadata, never probed outside fixtures.
+        if let root = ProcessInfo.processInfo.environment["ORBIT_SYNTHETIC_ROOT"],
+           !URL(fileURLWithPath: path).standardizedFileURL.path.hasPrefix(root + "/") { return false }
+        check(URL(fileURLWithPath: path))
+        return FileManager.default.fileExists(atPath: path)
+    }
+}
+
+struct BoardSources {
+    let cursorRoot: URL
+    let qoderRoot: URL
+    let codexDatabase: URL
+    let defaults: UserDefaults
+    var hookURL: URL? = nil
+    static var live: BoardSources {
+        precondition(!CommandLine.arguments.contains { $0.hasSuffix("-self-test") }, "Self-tests must inject sources")
+        return BoardSources(cursorRoot: CursorReader.root, qoderRoot: QoderReader.root,
+                            codexDatabase: CodexReader.databaseURL, defaults: .standard)
+    }
+    static func synthetic(_ directory: URL) -> BoardSources {
+        let suite = "orbit.synthetic." + directory.lastPathComponent
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        return BoardSources(cursorRoot: directory.appendingPathComponent("cursor"),
+                            qoderRoot: directory.appendingPathComponent("qoder"),
+                            codexDatabase: directory.appendingPathComponent("codex.sqlite"), defaults: defaults)
+    }
+}
+
 final class BoardModel: ObservableObject {
     @Published var tasks: [BoardTask] = [] {
         didSet { save() }
@@ -670,49 +720,128 @@ final class BoardModel: ObservableObject {
 
     private let fileURL: URL
     private let qoderEventsURL: URL
+    private let sources: BoardSources
+    private var loading = true
+    private var loadBlocked = false
+    private var loadedSnapshot = false
+    /// Test adapter throws before each filesystem mutation; production uses no adapter.
+    private let storageFault: ((String) throws -> Void)?
+    @Published private(set) var persistenceError: String?
 
-    init(dataDirectory: URL? = nil) {
+    init(dataDirectory: URL? = nil, sources: BoardSources? = nil,
+         storageFault: ((String) throws -> Void)? = nil) {
+        self.sources = sources ?? .live
+        self.storageFault = storageFault
         let support = dataDirectory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("DeskFocusBoard", isDirectory: true)
-        try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        SyntheticAccess.check(support)
         fileURL = support.appendingPathComponent("tasks.json")
-        qoderEventsURL = support.appendingPathComponent("qoder-events.jsonl")
-        if let data = try? Data(contentsOf: fileURL),
-           let saved = try? JSONDecoder().decode([BoardTask].self, from: data) {
-            let repaired = Self.normalizedAutoGroups(saved)
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys]
-            if (try? encoder.encode(saved)) != (try? encoder.encode(repaired)) {
-                let backup = support.appendingPathComponent("tasks-before-auto-group-repair.json")
-                do {
-                    if !FileManager.default.fileExists(atPath: backup.path) {
-                        try FileManager.default.copyItem(at: fileURL, to: backup)
-                    }
-                    tasks = repaired
-                    save()
-                } catch {
-                    // Keep original ownership if a recovery copy cannot be created.
-                    tasks = saved
-                }
-            } else {
-                tasks = saved
+        qoderEventsURL = self.sources.hookURL ?? support.appendingPathComponent("qoder-events.jsonl")
+        do {
+            try storageFault?("create")
+            try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+            let mainExists = FileManager.default.fileExists(atPath: fileURL.path)
+            let main = try? Data(contentsOf: fileURL)
+            let backup = try? Data(contentsOf: support.appendingPathComponent("tasks.json.bak"))
+            let saved = main.flatMap { try? JSONDecoder().decode([BoardTask].self, from: $0) }
+            let recovered = backup.flatMap { try? JSONDecoder().decode([BoardTask].self, from: $0) }
+            if mainExists && saved == nil {
+                try storageFault?("quarantine")
+                try FileManager.default.copyItem(at: fileURL, to: support.appendingPathComponent("tasks-unreadable-" + UUID().uuidString + ".json"))
             }
-        } else if FileManager.default.fileExists(atPath: fileURL.path) {
-            let recovery = support.appendingPathComponent("tasks-unreadable-recovery.json")
-            if !FileManager.default.fileExists(atPath: recovery.path) {
-                try? FileManager.default.copyItem(at: fileURL, to: recovery)
+            if let loaded = saved ?? recovered {
+                tasks = loaded
+                loadedSnapshot = true
+                let repaired = Self.normalizedAutoGroups(loaded)
+                if saved != nil, (try JSONEncoder().encode(loaded)) != (try JSONEncoder().encode(repaired)) {
+                    let repairBackup = support.appendingPathComponent("tasks-before-auto-group-repair.json")
+                    if !FileManager.default.fileExists(atPath: repairBackup.path) {
+                        try storageFault?("repairBackup")
+                        try FileManager.default.copyItem(at: fileURL, to: repairBackup)
+                    }
+                }
+                tasks = repaired
+                loading = false
+                // Repair/recovery only after the source snapshot is safely retained.
+                let changed = (try JSONEncoder().encode(loaded)) != (try JSONEncoder().encode(tasks))
+                if saved == nil || changed { save() }
+            } else if mainExists || FileManager.default.fileExists(atPath: support.appendingPathComponent("tasks.json.bak").path) {
+                loadBlocked = true
+                persistenceError = "任务文件无法读取，已保留隔离副本；请恢复有效备份后重试。"
+            }
+        } catch {
+            loadBlocked = true
+            persistenceError = "无法加载任务：\(error.localizedDescription)"
+        }
+        loading = false
+    }
+
+    func retrySave() {
+        if loadBlocked {
+            do {
+                let directory = fileURL.deletingLastPathComponent()
+                try storageFault?("create")
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                let backup = directory.appendingPathComponent("tasks.json.bak")
+                let exists = FileManager.default.fileExists(atPath: fileURL.path)
+                let main = try? Data(contentsOf: fileURL)
+                let saved = main.flatMap { try? JSONDecoder().decode([BoardTask].self, from: $0) }
+                let recovered = (try? Data(contentsOf: backup)).flatMap { try? JSONDecoder().decode([BoardTask].self, from: $0) }
+                if exists && saved == nil {
+                    try storageFault?("quarantine")
+                    try FileManager.default.copyItem(at: fileURL, to: directory.appendingPathComponent("tasks-unreadable-" + UUID().uuidString + ".json"))
+                }
+                if let loaded = saved ?? recovered {
+                    let normalized = Self.normalizedAutoGroups(loaded)
+                    let changed = (try JSONEncoder().encode(loaded)) != (try JSONEncoder().encode(normalized))
+                    let repairBackup = directory.appendingPathComponent("tasks-before-auto-group-repair.json")
+                    if saved != nil && changed && !FileManager.default.fileExists(atPath: repairBackup.path) {
+                        try storageFault?("repairBackup")
+                        try FileManager.default.copyItem(at: fileURL, to: repairBackup)
+                    }
+                    let local = tasks
+                    loading = true
+                    if !loadedSnapshot {
+                        tasks = Self.normalizedAutoGroups(local + loaded.filter { candidate in !local.contains { $0.id == candidate.id } })
+                        loadedSnapshot = true
+                    }
+                    loading = false
+                } else if exists || FileManager.default.fileExists(atPath: backup.path) {
+                    throw NSError(domain: "OrbitStorage", code: 1, userInfo: [NSLocalizedDescriptionKey: "请先恢复有效的任务文件或备份。"])
+                }
+                loadBlocked = false
+            } catch {
+                persistenceError = "无法恢复任务：\(error.localizedDescription)"
+                return
             }
         }
+        save()
     }
 
     private func save() {
-        guard let data = try? JSONEncoder().encode(tasks) else { return }
+        guard !loading, !loadBlocked else { return }
         let backup = fileURL.deletingLastPathComponent().appendingPathComponent("tasks.json.bak")
-        if FileManager.default.fileExists(atPath: fileURL.path) {
-            try? FileManager.default.removeItem(at: backup)
-            try? FileManager.default.copyItem(at: fileURL, to: backup)
-        }
-        try? data.write(to: fileURL, options: .atomic)
+        do {
+            let data = try JSONEncoder().encode(tasks)
+            let previous = try? Data(contentsOf: fileURL)
+            let validPrevious = previous.flatMap { try? JSONDecoder().decode([BoardTask].self, from: $0) } != nil
+            try storageFault?("write")
+            // Stage the complete new snapshot before touching either existing copy.
+            let staged = fileURL.deletingLastPathComponent().appendingPathComponent("tasks-stage-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: staged) }
+            try data.write(to: staged, options: .atomic)
+            try storageFault?("replace")
+            // Atomic write preserves the existing main on failure. Keep bak until this succeeds.
+            try data.write(to: fileURL, options: .atomic)
+            if validPrevious, let previous {
+                try storageFault?("backupRotate")
+                try previous.write(to: backup, options: .atomic)
+            } else if !FileManager.default.fileExists(atPath: backup.path) {
+                try storageFault?("backupRotate")
+                try data.write(to: backup, options: .atomic)
+            }
+            persistenceError = nil
+        } catch { persistenceError = "任务尚未保存：\(error.localizedDescription)" }
     }
 
     func add(_ title: String) {
@@ -848,7 +977,8 @@ final class BoardModel: ObservableObject {
         guard !isLoadingCodexRecent else { return }
         isLoadingCodexRecent = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let recent = CodexReader.recentThreads()
+            guard let self else { return }
+            let recent = CodexReader.recentThreads(databaseURL: self.sources.codexDatabase)
             DispatchQueue.main.async { [weak self] in
                 self?.setCodexRecentForBinding(recent)
                 self?.isLoadingCodexRecent = false
@@ -1056,7 +1186,7 @@ final class BoardModel: ObservableObject {
     }
 
     func pollCursor() {
-        let sessions = Dictionary(uniqueKeysWithValues: CursorReader.sessions().map { ($0.path, $0) })
+        let sessions = Dictionary(uniqueKeysWithValues: CursorReader.sessions(root: sources.cursorRoot).map { ($0.path, $0) })
         for task in tasks where task.cursorPath != nil {
             guard let path = task.cursorPath, let session = sessions[path] else { continue }
             if task.lastUserPreview != session.lastUserPreview {
@@ -1082,7 +1212,8 @@ final class BoardModel: ObservableObject {
         }
     }
 
-    func pollQoder(defaults: UserDefaults = .standard) {
+    func pollQoder(defaults suppliedDefaults: UserDefaults? = nil) {
+        let defaults = suppliedDefaults ?? sources.defaults
         let events = CursorReader.lines(at: qoderEventsURL.path)
         let savedCount = defaults.integer(forKey: "qoderEventLineCount")
         let oldCount = events.count < savedCount ? 0 : savedCount
@@ -1134,7 +1265,8 @@ final class BoardModel: ObservableObject {
         defaults.set(events.count, forKey: "qoderEventLineCount")
     }
 
-    func pollQoderTranscripts(root: URL = QoderReader.root) {
+    func pollQoderTranscripts(root suppliedRoot: URL? = nil) {
+        let root = suppliedRoot ?? sources.qoderRoot
         for session in QoderReader.sessions(root: root) {
             if let existing = tasks.firstIndex(where: { $0.qoderSessionID == session.id }) {
                 let childID = tasks[existing].id
@@ -1332,10 +1464,20 @@ struct BoardView: View {
     private var skin: BoardSkin { BoardSkin(rawValue: skinRaw) ?? .midnight }
     private var theme: BoardTheme { skin.theme }
 
+    @ViewBuilder private var persistenceStatus: some View {
+        if let error = model.persistenceError {
+            HStack {
+                Text(error).font(.system(size: 11)).foregroundStyle(.red)
+                Button("重试保存") { model.retrySave() }
+            }.padding(8)
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider().overlay(theme.border.opacity(0.55))
+            persistenceStatus
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
                     if showNewTaskField { newTaskRow }
@@ -2170,7 +2312,99 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc private func quit() { NSApp.terminate(nil) }
 }
 
-if CommandLine.arguments.contains("--cursor-scan") {
+func runPersistenceSelfTest() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-storage-" + UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let main = directory.appendingPathComponent("tasks.json")
+    let backup = directory.appendingPathComponent("tasks.json.bak")
+    let original = [BoardTask(title: "恢复任务一"), BoardTask(title: "恢复任务二")]
+    let encoded = try JSONEncoder().encode(original)
+    try encoded.write(to: backup)
+    try Data("broken".utf8).write(to: main)
+    let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
+    precondition(model.tasks.map(\.id) == original.map(\.id))
+    precondition(model.persistenceError == nil)
+    let quarantines = try FileManager.default.contentsOfDirectory(atPath: directory.path).filter { $0.hasPrefix("tasks-unreadable-") }
+    precondition(quarantines.count == 1)
+    precondition(try! Data(contentsOf: directory.appendingPathComponent(quarantines[0])) == Data("broken".utf8))
+    model.add("第三项"); model.add("第四项")
+    precondition(try! JSONDecoder().decode([BoardTask].self, from: Data(contentsOf: backup)).count == 3)
+    precondition(try! JSONDecoder().decode([BoardTask].self, from: Data(contentsOf: main)).count == 4)
+    for stage in ["write", "replace", "backupRotate"] {
+        var fail = false
+        let tested = BoardModel(dataDirectory: directory, sources: .synthetic(directory), storageFault: { point in
+            if fail && point == stage { throw NSError(domain: "SyntheticStorage", code: 1) }
+        })
+        let count = tested.tasks.count
+        let priorBackup = try Data(contentsOf: backup)
+        fail = true
+        tested.add("故障-" + stage)
+        precondition(tested.tasks.count == count + 1 && tested.persistenceError != nil)
+        precondition((try? JSONDecoder().decode([BoardTask].self, from: Data(contentsOf: main))) != nil)
+        precondition(try! Data(contentsOf: backup) == priorBackup)
+        fail = false
+        tested.retrySave()
+        precondition(tested.persistenceError == nil)
+        precondition(try! JSONDecoder().decode([BoardTask].self, from: Data(contentsOf: main)).count == count + 1)
+    }
+    // Two corruptions retain distinct evidence, and neither can overwrite the valid backup.
+    let goodBackup = try Data(contentsOf: backup)
+    try Data("broken-again".utf8).write(to: main)
+    var failReplace = true
+    let recovering = BoardModel(dataDirectory: directory, sources: .synthetic(directory), storageFault: { point in
+        if failReplace && point == "replace" { throw NSError(domain: "SyntheticStorage", code: 2) }
+    })
+    precondition(!recovering.tasks.isEmpty && recovering.persistenceError != nil)
+    precondition(try! Data(contentsOf: backup) == goodBackup)
+    precondition(try! FileManager.default.contentsOfDirectory(atPath: directory.path).filter { $0.hasPrefix("tasks-unreadable-") }.count == 2)
+    failReplace = false
+    recovering.retrySave()
+    precondition(recovering.persistenceError == nil)
+    for stage in ["create", "quarantine"] {
+        if stage == "quarantine" { try Data("bad quarantine".utf8).write(to: main) }
+        let snapshot = try Data(contentsOf: backup)
+        let tested = BoardModel(dataDirectory: directory, sources: .synthetic(directory), storageFault: { point in
+            if point == stage { throw NSError(domain: "SyntheticStorage", code: 3) }
+        })
+        precondition(tested.persistenceError != nil)
+        let unreadMain = try? Data(contentsOf: main)
+        tested.add("加载失败后的本地编辑")
+        precondition((try? Data(contentsOf: main)) == unreadMain)
+        precondition(try! Data(contentsOf: backup) == snapshot)
+    }
+    let repairDirectory = directory.appendingPathComponent("repair")
+    try FileManager.default.createDirectory(at: repairDirectory, withIntermediateDirectories: true)
+    var autoOne = BoardTask(title: "old auto"); autoOne.isAutoGroup = true; autoOne.projectKey = "/tmp/repair"
+    var autoTwo = BoardTask(title: "second auto"); autoTwo.isAutoGroup = true; autoTwo.projectKey = "/tmp/repair"
+    let manual = BoardTask(title: "original manual")
+    try JSONEncoder().encode([autoOne, autoTwo, manual]).write(to: repairDirectory.appendingPathComponent("tasks.json"))
+    var failRepair = true
+    let repairing = BoardModel(dataDirectory: repairDirectory, sources: .synthetic(repairDirectory), storageFault: { point in
+        if failRepair && point == "repairBackup" { throw NSError(domain: "SyntheticStorage", code: 4) }
+    })
+    precondition(repairing.persistenceError != nil)
+    repairing.renameTask(manual.id, to: "local edit survives retry")
+    failRepair = false
+    repairing.retrySave()
+    precondition(repairing.persistenceError == nil)
+    precondition(FileManager.default.fileExists(atPath: repairDirectory.appendingPathComponent("tasks-before-auto-group-repair.json").path))
+    let repairRestored = BoardModel(dataDirectory: repairDirectory, sources: .synthetic(repairDirectory))
+    precondition(repairRestored.tasks.contains { $0.id == manual.id && $0.title == "local edit survives retry" })
+    print("Persistence recovery self-test passed")
+}
+
+if CommandLine.arguments.contains("--persistence-self-test") {
+    try runPersistenceSelfTest()
+} else if CommandLine.arguments.contains("--intentional-failure-self-test") {
+    exit(42)
+} else if CommandLine.arguments.contains("--reader-symlink-self-test") {
+    _ = CursorReader.lines(at: ProcessInfo.processInfo.environment["ORBIT_SYMLINK_ESCAPE"]!)
+    exit(0)
+} else if CommandLine.arguments.contains("--reader-escape-self-test") {
+    _ = CursorReader.sessions(root: URL(fileURLWithPath: ProcessInfo.processInfo.environment["ORBIT_READER_ESCAPE"]!))
+    exit(0)
+} else if CommandLine.arguments.contains("--cursor-scan") {
     print("Cursor sessions: \(CursorReader.sessions().count)")
 } else if CommandLine.arguments.contains("--qoder-scan") {
     print("Qoder sessions: \(QoderReader.sessions().map { "\($0.id) \($0.state.rawValue)" })")
@@ -2199,7 +2433,7 @@ if CommandLine.arguments.contains("--cursor-scan") {
     let recent = CodexReader.recentThreads(databaseURL: databaseURL)
     precondition(recent.count == 1 && recent[0].id == threadID)
     precondition(CodexReader.recentActivity(at: recent[0].rolloutPath)?.0 == .human)
-    let model = BoardModel(dataDirectory: directory)
+    let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
     model.add("自定义任务一")
     model.add("自定义任务二")
     let first = model.tasks.first { $0.title == "自定义任务一" }!
@@ -2216,7 +2450,7 @@ if CommandLine.arguments.contains("--cursor-scan") {
     }
     precondition(model.tasks.first(where: { $0.id == bound.id })?.state == .human)
     model.bindSession(bound.id, to: second.id)
-    let restored = BoardModel(dataDirectory: directory)
+    let restored = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
     precondition(restored.visibleChildren(of: first.id).contains { $0.codexThreadID == threadID })
     precondition(restored.visibleChildren(of: second.id).contains { $0.codexThreadID == threadID })
     print("Codex recent self-test passed")
@@ -2261,7 +2495,7 @@ if CommandLine.arguments.contains("--cursor-scan") {
     precondition(encodedOnce == encodedTwice)
     let file = directory.appendingPathComponent("tasks.json")
     try encoder.encode(original).write(to: file)
-    let model = BoardModel(dataDirectory: directory)
+    let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
     precondition(FileManager.default.fileExists(atPath: directory.appendingPathComponent("tasks-before-auto-group-repair.json").path))
     precondition(model.tasks.filter { $0.isAutoGroup && $0.projectKey == key }.count == 1)
     model.setState(current.id, to: .done)
@@ -2270,7 +2504,7 @@ if CommandLine.arguments.contains("--cursor-scan") {
     model.importCursor(session)
     precondition(model.tasks.filter { $0.isAutoGroup && $0.projectKey == key }.count == 1)
     precondition(model.tasks.first { $0.cursorPath == session.path }!.parentID == current.id)
-    let restored = BoardModel(dataDirectory: directory)
+    let restored = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
     precondition(restored.tasks.filter { $0.isAutoGroup && $0.projectKey == key }.count == 1)
     print("Automatic group repair self-test passed")
 } else if CommandLine.arguments.contains("--qoder-resume-self-test") {
@@ -2289,7 +2523,7 @@ if CommandLine.arguments.contains("--cursor-scan") {
     }
     let old = try userRecord("旧问题", at: Date().addingTimeInterval(-120))
     try old.write(to: transcript, atomically: true, encoding: .utf8)
-    let model = BoardModel(dataDirectory: directory)
+    let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
     model.pollQoderTranscripts(root: root)
     let id = model.tasks.first { $0.qoderSessionID == "resume-test" }!.id
     model.setState(id, to: .done)
@@ -2362,7 +2596,7 @@ if CommandLine.arguments.contains("--cursor-scan") {
     try (qoderUser + qoderAssistant).write(to: qoderProject.appendingPathComponent("human.jsonl"),
                                       atomically: true, encoding: .utf8)
     precondition(QoderReader.sessions(root: qoderRoot).first?.state == .human)
-    let model = BoardModel(dataDirectory: directory)
+    let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
     let session = CursorSession(path: directory.appendingPathComponent("human.jsonl").path,
                                 title: "澄清需求", lastUserPreview: "请修改代码", modified: Date(),
                                 lineCount: 3, projectKey: directory.path, projectTitle: "测试项目", state: .human)
@@ -2373,7 +2607,7 @@ if CommandLine.arguments.contains("--cursor-scan") {
     precondition(model.summarySessionCount(for: parent) == 1)
     model.setState(child.id, to: .ready)
     precondition(model.displayState(for: parent) == .ready)
-    let restored = BoardModel(dataDirectory: directory)
+    let restored = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
     precondition(restored.tasks.first { $0.id == child.id }?.state == .ready)
     print("Human-state self-test passed")
 } else if CommandLine.arguments.contains("--codex-self-test") {
@@ -2406,7 +2640,7 @@ if CommandLine.arguments.contains("--cursor-scan") {
     let waiting = CodexReader.sessions(databaseURL: databaseURL, now: Date().addingTimeInterval(-10))
     precondition(waiting.count == 1 && waiting[0].state == .waiting && waiting[0].title == "测试 Codex 会话")
     precondition(waiting[0].lastUserPreview == "第一次输入")
-    let model = BoardModel(dataDirectory: directory)
+    let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
     model.mergeCodex(waiting)
     precondition(model.children(of: model.active[0].id).first?.state == .waiting)
     let secondInput = "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"第二次输入\"}]}}\n"
@@ -2420,7 +2654,7 @@ if CommandLine.arguments.contains("--cursor-scan") {
     precondition(model.children(of: model.active[0].id).first?.state == .ready)
     precondition(model.children(of: model.active[0].id).first?.lastUserPreview == "第二次输入")
     precondition(model.navigationTarget(for: model.active[0])?.codexThreadID == "test-thread")
-    let restored = BoardModel(dataDirectory: directory)
+    let restored = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
     precondition(restored.tasks.contains { $0.codexThreadID == "test-thread" && $0.lastUserPreview == "第二次输入" })
     let humanReply = "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"请确认你希望使用哪个目录。\"}]}}\n"
     let needsHuman = started + secondInput + humanReply + "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n"
@@ -2430,7 +2664,7 @@ if CommandLine.arguments.contains("--cursor-scan") {
 } else if CommandLine.arguments.contains("--grouping-self-test") {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("deskfocus-grouping-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: directory) }
-    let model = BoardModel(dataDirectory: directory)
+    let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
     let first = CursorSession(path: "/tmp/one.jsonl", title: "会话一", lastUserPreview: "会话一", modified: Date(), lineCount: 1,
                               projectKey: "/tmp/project", projectTitle: "project")
     let second = CursorSession(path: "/tmp/two.jsonl", title: "会话二", lastUserPreview: "会话二", modified: Date(), lineCount: 1,
@@ -2451,7 +2685,7 @@ if CommandLine.arguments.contains("--cursor-scan") {
     model.bindSession(firstID, to: secondParent.id)
     precondition(model.tasks.first { $0.id == firstID }?.belongs(to: customParent.id) == true)
     precondition(model.tasks.first { $0.id == firstID }?.belongs(to: secondParent.id) == true)
-    let restoredBound = BoardModel(dataDirectory: directory)
+    let restoredBound = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
     precondition(restoredBound.tasks.first { $0.id == firstID }?.belongs(to: customParent.id) == true)
     precondition(restoredBound.tasks.first { $0.id == firstID }?.belongs(to: secondParent.id) == true)
     model.unbindSession(firstID, from: customParent.id)
@@ -2463,14 +2697,14 @@ if CommandLine.arguments.contains("--cursor-scan") {
     model.bindSession(firstID, to: autoParentID)
     model.remove(customParent.id)
     model.remove(secondParent.id)
-    let restored = BoardModel(dataDirectory: directory)
+    let restored = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
     precondition(restored.active.count == 1)
     precondition(restored.children(of: restored.active[0].id).count == 2)
     print("Grouping self-test passed")
 } else if CommandLine.arguments.contains("--lifecycle-self-test") {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("deskfocus-lifecycle-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: directory) }
-    let model = BoardModel(dataDirectory: directory)
+    let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
     let now = Date()
     let old = CursorSession(path: directory.appendingPathComponent("old.jsonl").path, title: "旧会话", lastUserPreview: "旧会话",
                             modified: now.addingTimeInterval(-2 * 86400), lineCount: 1,
@@ -2515,11 +2749,13 @@ if CommandLine.arguments.contains("--cursor-scan") {
         return copy
     }
     try! JSONSerialization.data(withJSONObject: withoutNewKeys).write(to: legacyURL)
-    let restored = BoardModel(dataDirectory: directory)
+    let restored = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
     precondition(restored.tasks.count == model.tasks.count)
     precondition(restored.tasks.contains { $0.id == parent.id && $0.isAutoGroup })
 
-    let livePath = directory.appendingPathComponent("live.jsonl")
+    let cursorAgent = directory.appendingPathComponent("cursor/synthetic/agent-transcripts/live")
+    try! FileManager.default.createDirectory(at: cursorAgent, withIntermediateDirectories: true)
+    let livePath = cursorAgent.appendingPathComponent("live.jsonl")
     try! "{\"role\":\"user\"}\n{\"type\":\"turn_ended\"}\n".write(to: livePath, atomically: true, encoding: .utf8)
     let live = CursorSession(path: livePath.path, title: "同步测试", lastUserPreview: "同步测试", modified: now.addingTimeInterval(-3600),
                              lineCount: 0, projectKey: directory.path, projectTitle: "测试项目")
