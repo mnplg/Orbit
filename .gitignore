@@ -1,0 +1,12 @@
+.DS_Store
+*.app/
+*.zip
+旧版备份/
+.build/
+.env
+.env.*
+!.env.example
+
+# Local screenshots may contain private session information.
+/预览.png
+/Assets/background-concepts/Orbit-云白玻璃-预览.png

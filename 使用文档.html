@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Orbit · 使用文档</title>
+  <style>
+    :root { --bg:#11151d; --panel:#1c222d; --card:#242c39; --text:#f4f7fb; --muted:#a8b2c2; --accent:#78a8ff; --line:#354052; --yellow:#ffd21f; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--text); background:radial-gradient(circle at 80% -10%, #294268 0, transparent 38%), var(--bg); font:16px/1.75 -apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",sans-serif; }
+    main { max-width:900px; margin:0 auto; padding:48px 22px 80px; }
+    .hero { padding:34px; border:1px solid var(--line); border-radius:24px; background:linear-gradient(135deg, #1d2e4a, #1a202b 65%); box-shadow:0 20px 60px #0005; }
+    .badge { display:inline-block; padding:3px 10px; border-radius:999px; color:#111; background:var(--yellow); font-weight:700; font-size:13px; }
+    h1 { margin:14px 0 4px; font-size:34px; letter-spacing:-.04em; } h2 { margin-top:42px; font-size:23px; } h3 { margin-top:26px; font-size:18px; }
+    p, li { color:var(--muted); } strong { color:var(--text); }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; margin:22px 0; }
+    .card { padding:18px; border:1px solid var(--line); border-radius:16px; background:var(--panel); } .card h3 { margin:0 0 5px; }
+    code, .path { padding:2px 6px; border-radius:6px; background:#0b0e13; color:#c9d9ff; font-family:ui-monospace,SFMono-Regular,monospace; font-size:.9em; }
+    .steps { counter-reset:step; padding:0; list-style:none; } .steps li { counter-increment:step; display:flex; gap:12px; margin:12px 0; }
+    .steps li::before { content:counter(step); flex:0 0 28px; height:28px; border-radius:50%; text-align:center; color:#111; background:var(--accent); font-weight:700; line-height:28px; }
+    .note { border-left:4px solid var(--yellow); padding:10px 16px; background:#342c15; border-radius:0 10px 10px 0; }
+    footer { margin-top:48px; color:#748197; font-size:13px; }
+  </style>
+</head>
+<body><main>
+  <section class="hero"><span class="badge">macOS 本地工具</span><h1>Orbit</h1><p>当你同时等待多个 AI 编程会话时，用一个悬浮小窗记住当前正在做什么。</p></section>
+
+  <h2>一、安装和启动</h2>
+  <ol class="steps">
+    <li>解压发布包，把 <strong>Orbit.app</strong> 拖到“应用程序”或其他你喜欢的位置。</li>
+    <li>第一次打开如果 macOS 提示无法验证开发者，请在 Finder 中对应用<strong>按住 Control 点击 → 打开 → 打开</strong>。这是未提交公证的本地应用常见提示。</li>
+    <li>启动后会出现一个常驻桌面的小窗。它会浮在其他窗口上方，也可以从菜单栏图标显示、隐藏或退出。任务卡片采用紧凑布局；拖动窗口边缘可一次看到更多任务组，调整后的位置和大小会自动记住；任务较多时可在卡片区域滚动。</li>
+  </ol>
+  <div class="note">任务数据保存在当前用户本机，不会上传到服务器。</div>
+
+  <h2>二、自动识别 AI 会话</h2>
+  <div class="grid">
+    <div class="card"><h3>Qoder</h3><p>双击发布包里的 <strong>连接Qoder.command</strong>，按提示连接 Hook，然后重启 Qoder。任务板会按项目目录自动归组。</p></div>
+    <div class="card"><h3>Cursor</h3><p>任务板会读取当前用户已跟踪的 Cursor 本地记录。首次使用后等待几秒，最近会话会出现在对应项目组里。</p></div>
+    <div class="card"><h3>Codex</h3><p>任务板会读取本机最近七天的 Codex 任务，并按项目目录归组。发送消息后显示“等待 AI”，回复结束后显示“待我处理”；点击会话可跳转到 Codex 中对应的任务。</p></div>
+  </div>
+  <p>主体任务下可以挂多个会话。最近活跃的会话会显示在最上方；每条会话第一行是最后一次由你输入的内容（最多 30 字，超出显示省略号），第二行右侧是会话名称。展开后按活跃时间从新到旧排列。超过一天未更新的会话会隐藏，项目分组超过七天没有更新也会隐藏。</p>
+
+  <h2>三、日常操作</h2>
+  <ul>
+    <li>点击主体任务的名称可修改名称；点击状态摘要或左侧图标，以及点击会话行，可以尝试打开对应的 AI 编程窗口。会话名称由本地会话自动提供。</li>
+    <li>标题旁的 <strong>+</strong> 新增主体任务；直接点击主体任务名称即可就地修改，按回车或点击其他位置保存。星标用于标记重要主体任务，任务组右侧菜单用于修改状态和绑定会话。</li>
+    <li>点击任务组顶部的星标，把主体任务加入星标筛选。标题区的星标按钮可以切换“只看星标”。</li>
+    <li>打开主体任务右侧的 <strong>···</strong> 菜单，选择“绑定会话”，可以搜索 Qoder / Cursor / Codex 会话，也能找到 Codex 左侧“最近”里的旧任务。超过一天未更新的旧任务绑定后会自动保留显示；会话菜单中的“移出主体任务”可以撤销归组。</li>
+    <li>AI 回复明确要求你澄清问题或手动操作时，会话会自动显示“需人工”；如果识别不准确，可在任务或会话右侧的 <strong>···</strong> 菜单里手动修改。主体任务摘要里的会话数只统计当前状态对应的会话。</li>
+    <li>点击调色板按钮，可以切换“默认深色”“星夜电气”和“云白玻璃”皮肤。云白玻璃使用浅色渐变、半透明白卡片和蓝色强调；星夜电气的角色与云层插画包含在应用里，离线也能显示。选择会自动记住。</li>
+  </ul>
+
+  <h2>四、数据和权限</h2>
+  <p>任务数据位置：<span class="path">~/Library/Application Support/DeskFocusBoard/tasks.json</span>。这个内部目录名为兼容旧版而保留，升级为 Orbit 不会重置任务数据。程序只读取本机的 Cursor / Qoder / Codex 会话记录，并保存任务状态、项目归组和必要的 Hook 事件信息。Codex 的本地记录位于 <span class="path">~/.codex/</span>；记录格式可能随 Codex 版本变化。</p>
+  <p>换电脑时，任务数据不会随应用自动迁移；如果需要保留任务，可在旧电脑复制整个 <span class="path">DeskFocusBoard</span> 文件夹到新电脑同一位置。</p>
+
+  <h2>五、常见问题</h2>
+  <h3>启动后没有会话</h3><p>确认 Cursor、Qoder 或 Codex 已经产生本地会话；Qoder 需要先运行连接脚本并重启。任务板每 5 秒同步一次，也可以退出后重新打开。</p>
+  <h3>应用被 macOS 拦截</h3><p>不要直接双击反复尝试，请在 Finder 中 Control 点击应用，选择“打开”。如果公司电脑有安全策略，请联系管理员允许本地未签名应用。</p>
+  <h3>窗口不见了</h3><p>点击菜单栏里的任务板图标，选择“显示任务板”。</p>
+  <h3>如何更新</h3><p>退出旧版本，把新版本应用替换进去。任务数据在 Application Support 中，正常更新不会删除。</p>
+
+  <footer>Orbit · 本地运行 · 适用于 macOS 13 及以上</footer>
+</main></body></html>
