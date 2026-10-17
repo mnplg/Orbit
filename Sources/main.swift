@@ -236,7 +236,8 @@ struct BoardTask: Identifiable, Codable, Equatable {
         groupingMode = try values.decodeIfPresent(GroupingMode.self, forKey: .groupingMode)
             ?? (parentID == nil && !boundParentIDs.isEmpty ? .manual : .auto)
         isTitleCustomized = try values.decodeIfPresent(Bool.self, forKey: .isTitleCustomized) ?? false
-        completionOverride = try values.decodeIfPresent(Bool.self, forKey: .completionOverride) ?? false
+        completionOverride = try values.decodeIfPresent(Bool.self, forKey: .completionOverride)
+            ?? (!isConversation && state == .done)
         let legacyProjectName = projectKey.map { URL(fileURLWithPath: $0).lastPathComponent }
         isAutoGroup = try values.decodeIfPresent(Bool.self, forKey: .isAutoGroup)
             ?? (parentID == nil && !isConversation && projectKey != nil &&
@@ -3002,6 +3003,31 @@ if CommandLine.arguments.contains("--recovery-ui-self-test") {
         precondition(model.displayState(for: model.tasks.first { $0.id == parentID }!) == .human)
         model.setState(child.id, to: .waiting)
     }
+    // Old formats stored the owner's done state but had no explicit completion override.
+    let migrationDirectory = directory.appendingPathComponent("legacy-completion")
+    try FileManager.default.createDirectory(at: migrationDirectory, withIntermediateDirectories: true)
+    var legacyOwner = BoardTask(title: "旧格式已完成主体"); legacyOwner.state = .done
+    let sharedOwner = BoardTask(title: "共享的另一个主体")
+    var sharedChild = BoardTask(title: "仍在等待的共享会话")
+    sharedChild.qoderSessionID = "legacy-shared-waiting"; sharedChild.state = .waiting
+    sharedChild.parentID = sharedOwner.id; sharedChild.boundParentIDs = [legacyOwner.id]
+    var legacyCompletedSession = BoardTask(title: "旧格式已完成会话")
+    legacyCompletedSession.codexThreadID = "legacy-done-session"; legacyCompletedSession.state = .done
+    let fixture = try JSONSerialization.jsonObject(with: JSONEncoder().encode([legacyOwner, sharedOwner, sharedChild, legacyCompletedSession])) as! [[String: Any]]
+    let oldFormat = fixture.map { row -> [String: Any] in
+        var legacy = row; legacy.removeValue(forKey: "completionOverride"); return legacy
+    }
+    try JSONSerialization.data(withJSONObject: oldFormat).write(to: migrationDirectory.appendingPathComponent("tasks.json"))
+    let migrated = BoardModel(dataDirectory: migrationDirectory, sources: .synthetic(migrationDirectory))
+    let closedOwner = migrated.tasks.first { $0.id == legacyOwner.id }!
+    precondition(closedOwner.completionOverride && migrated.displayState(for: closedOwner) == .done)
+    precondition(migrated.tasks.first { $0.id == sharedChild.id }!.state == .waiting)
+    precondition(migrated.displayState(for: migrated.tasks.first { $0.id == sharedOwner.id }!) == .waiting)
+    precondition(!migrated.tasks.first { $0.id == legacyCompletedSession.id }!.completionOverride)
+    precondition(migrated.tasks.first { $0.id == legacyCompletedSession.id }!.state == .done)
+    // A present false from the new format remains an explicit reopening/aggregation choice.
+    let explicitFalse = try JSONDecoder().decode(BoardTask.self, from: JSONEncoder().encode(legacyOwner))
+    precondition(!explicitFalse.completionOverride)
     print("Completion override self-test passed")
 } else if CommandLine.arguments.contains("--grouping-intent-self-test") {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-intent-" + UUID().uuidString)
