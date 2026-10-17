@@ -336,11 +336,21 @@ struct QoderSession {
     let modified: Date
     let projectKey: String
     let projectTitle: String
+    let lastPromptAt: Date?
 }
 
 enum QoderReader {
     static let root = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".qoder/projects", isDirectory: true)
+
+    static func timestamp(_ value: Any?) -> Date? {
+        guard let text = value as? String else { return nil }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: text) { return date }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: text)
+    }
 
     static func sessions(root: URL = root) -> [QoderSession] {
         guard let projects = try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else { return [] }
@@ -354,6 +364,7 @@ enum QoderReader {
                 let events = CursorReader.lines(at: file.path)
                 var title: String? = nil
                 var lastInput = ""
+                var lastPromptAt: Date?
                 var lastPrompt = -1
                 var lastCompletion = -1
                 var lastCompletionText = ""
@@ -371,6 +382,7 @@ enum QoderReader {
                         if !prompt.isEmpty {
                             if title == nil { title = String(prompt.prefix(90)) }
                             lastInput = prompt
+                            lastPromptAt = timestamp(event["timestamp"])
                             lastPrompt = index
                         }
                     }
@@ -392,7 +404,8 @@ enum QoderReader {
                                               ? (HumanActionDetector.needsHuman(lastCompletionText) ? .human : .ready)
                                               : .waiting,
                                           lineCount: events.count, modified: modified,
-                                          projectKey: projectPath, projectTitle: projectTitle))
+                                          projectKey: projectPath, projectTitle: projectTitle,
+                                          lastPromptAt: lastPromptAt))
             }
         }
         return found.sorted { $0.modified > $1.modified }
@@ -636,6 +649,85 @@ enum CodexReader {
         case "turn_aborted": return .working
         default: return nil
         }
+    }
+}
+
+enum QoderTerminalLauncher {
+    enum LaunchError: LocalizedError {
+        case missingCLI, missingProject, invalidSession, missingTerminal
+        var errorDescription: String? {
+            switch self {
+            case .missingCLI: return "未找到 Qoder CLI。请先安装官方 CLI，再重试。"
+            case .missingProject: return "此会话的本地项目目录不存在，无法在正确的目录恢复。"
+            case .invalidSession: return "此会话没有有效的 Qoder 会话 ID。"
+            case .missingTerminal: return "未找到 macOS 终端应用。"
+            }
+        }
+    }
+
+    static func executable() -> URL? {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let candidates = [home.appendingPathComponent(".local/bin/qodercli"),
+                          home.appendingPathComponent(".qoder/bin/qodercli/qodercli")]
+            + (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":")
+                .map { URL(fileURLWithPath: String($0)).appendingPathComponent("qodercli") }
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    }
+
+    static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
+    }
+
+    static func script(executable: URL, project: String, sessionID: String) throws -> String {
+        guard let match = sessionID.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$", options: .regularExpression),
+              match == sessionID.startIndex..<sessionID.endIndex else {
+            throw LaunchError.invalidSession
+        }
+        var isDirectory: ObjCBool = false
+        guard project.hasPrefix("/"),
+              FileManager.default.fileExists(atPath: project, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw LaunchError.missingProject
+        }
+        // Quote each argument separately: project names are data, never shell code.
+        let command = [executable.path, "--cwd", project, "--resume", sessionID].map(shellQuote).joined(separator: " ")
+        return "#!/bin/zsh\n# Orbit: resume an existing Qoder session without submitting a prompt.\n"
+            + "trap '/bin/rm -f -- \"$0\"' EXIT\n"
+            + command + "\nresult=$?\n"
+            + "if (( result != 0 )); then\n  print 'Qoder CLI 未能恢复会话，请查看上方提示。'\nfi\nexit $result\n"
+    }
+
+    static func launch(project: String, sessionID: String) throws {
+        guard let cli = executable() else { throw LaunchError.missingCLI }
+        let contents = try script(executable: cli, project: project, sessionID: sessionID)
+        guard let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") else {
+            throw LaunchError.missingTerminal
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-terminal-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                               attributes: [.posixPermissions: 0o700])
+        let file = directory.appendingPathComponent("恢复 Qoder 会话.command")
+        do {
+            try contents.write(to: file, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: file.path)
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+        NSWorkspace.shared.open([file], withApplicationAt: terminal,
+                                configuration: NSWorkspace.OpenConfiguration()) { _, error in
+            if let error {
+                try? FileManager.default.removeItem(at: directory)
+                DispatchQueue.main.async { showError(error) }
+            }
+        }
+    }
+
+    static func showError(_ error: Error) {
+        let alert = NSAlert()
+        alert.messageText = "无法在终端恢复 Qoder 会话"
+        alert.informativeText = error.localizedDescription
+        alert.addButton(withTitle: "知道了")
+        alert.runModal()
     }
 }
 
@@ -906,10 +998,23 @@ final class BoardModel: ObservableObject {
         if let threadID = target.codexThreadID,
            let url = URL(string: "codex://threads/\(threadID)"),
            NSWorkspace.shared.open(url) { return }
+        if let sessionID = target.qoderSessionID {
+            QoderDesktopNavigator.shared.open(id: sessionID)
+            return
+        }
         guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier:
             target.codexThreadID != nil ? "com.openai.codex" :
                 (target.qoderSessionID == nil ? "com.todesktop.230313mzl4w4u92" : "com.qoder.app")) else { return }
         NSWorkspace.shared.openApplication(at: appURL, configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
+    }
+
+    func resumeQoderInTerminal(_ task: BoardTask) {
+        do {
+            guard let sessionID = task.qoderSessionID else { throw QoderTerminalLauncher.LaunchError.invalidSession }
+            try QoderTerminalLauncher.launch(project: task.projectKey ?? "", sessionID: sessionID)
+        } catch {
+            QoderTerminalLauncher.showError(error)
+        }
     }
 
     func isVisible(_ task: BoardTask, now: Date = Date()) -> Bool {
@@ -978,9 +1083,10 @@ final class BoardModel: ObservableObject {
         }
     }
 
-    func pollQoder() {
+    func pollQoder(defaults: UserDefaults = .standard) {
         let events = CursorReader.lines(at: qoderEventsURL.path)
-        let oldCount = UserDefaults.standard.integer(forKey: "qoderEventLineCount")
+        let savedCount = defaults.integer(forKey: "qoderEventLineCount")
+        let oldCount = events.count < savedCount ? 0 : savedCount
         guard events.count > oldCount else { return }
         for event in events.dropFirst(oldCount) {
             guard let sessionID = event["session_id"] as? String, !sessionID.isEmpty,
@@ -1018,17 +1124,19 @@ final class BoardModel: ObservableObject {
                let preview = event["prompt_preview"] as? String, !preview.isEmpty {
                 tasks[index].lastUserPreview = userInputPreview(preview)
             }
-            if tasks[index].state != .done, tasks[index].state != nextState {
+            let promptTime = QoderReader.timestamp(event["timestamp"]) ?? Date()
+            let newPrompt = eventName == "UserPromptSubmit" && promptTime > tasks[index].stateSince
+            if (tasks[index].state != .done || newPrompt), tasks[index].state != nextState {
                 tasks[index].state = nextState
                 tasks[index].stateSince = Date()
             }
             tasks[index].lastActivityAt = Date()
         }
-        UserDefaults.standard.set(events.count, forKey: "qoderEventLineCount")
+        defaults.set(events.count, forKey: "qoderEventLineCount")
     }
 
-    func pollQoderTranscripts() {
-        for session in QoderReader.sessions() {
+    func pollQoderTranscripts(root: URL = QoderReader.root) {
+        for session in QoderReader.sessions(root: root) {
             if let existing = tasks.firstIndex(where: { $0.qoderSessionID == session.id }) {
                 let childID = tasks[existing].id
                 if tasks[existing].projectKey != session.projectKey {
@@ -1043,10 +1151,12 @@ final class BoardModel: ObservableObject {
                 if tasks[index].lastUserPreview != session.lastUserPreview {
                     tasks[index].lastUserPreview = session.lastUserPreview
                 }
-                guard session.lineCount > tasks[index].qoderObservedLines else { continue }
+                let hasNewPrompt = session.lastPromptAt.map { $0 > tasks[index].stateSince } ?? false
+                guard session.lineCount != tasks[index].qoderObservedLines
+                        || (tasks[index].state == .done && hasNewPrompt) else { continue }
                 tasks[index].qoderObservedLines = session.lineCount
                 tasks[index].lastActivityAt = min(session.modified, Date())
-                if tasks[index].state != .done, tasks[index].state != session.state {
+                if (tasks[index].state != .done || hasNewPrompt), tasks[index].state != session.state {
                     tasks[index].state = session.state
                     tasks[index].stateSince = Date()
                 }
@@ -1818,6 +1928,14 @@ struct SessionRow: View {
 
     private var sessionMenu: some View {
         VStack(alignment: .leading, spacing: 3) {
+            if task.qoderSessionID != nil {
+                Button("在终端恢复（CLI）") {
+                    menuOpen = false
+                    model.resumeQoderInTerminal(task)
+                }
+                .help("用 Qoder CLI 恢复此会话；首次使用可能需要登录或确认项目目录")
+                Divider()
+            }
             ForEach(TaskState.allCases) { state in
                 Button(state.rawValue) { model.setState(task.id, to: state); menuOpen = false }
             }
@@ -1838,7 +1956,123 @@ struct SessionRow: View {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    private var edgeTimer: Timer?
+    private var edgeHandle: NSPanel!
+    private var topDocked = false
+    private var edgeCollapsed = false
+    private var explicitlyHidden = false
+    private var pointerLeftAt: Date?
+    private var menuIsTracking = false
+
+    private func setupTopEdge() {
+        panel.delegate = self
+        NotificationCenter.default.addObserver(self, selector: #selector(menuTrackingBegan),
+                                               name: NSMenu.didBeginTrackingNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(menuTrackingEnded),
+                                               name: NSMenu.didEndTrackingNotification, object: nil)
+        edgeHandle = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
+                             backing: .buffered, defer: false)
+        edgeHandle.level = .floating
+        edgeHandle.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        edgeHandle.isOpaque = false
+        edgeHandle.backgroundColor = .clear
+        edgeHandle.hasShadow = false
+        edgeHandle.isReleasedWhenClosed = false
+        let grip = NSView()
+        grip.wantsLayer = true
+        grip.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.85).cgColor
+        grip.layer?.cornerRadius = 3
+        edgeHandle.contentView = grip
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            self?.updateTopEdge()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        edgeTimer = timer
+    }
+
+    @objc private func menuTrackingBegan() { menuIsTracking = true }
+    @objc private func menuTrackingEnded() {
+        menuIsTracking = false
+        pointerLeftAt = nil
+    }
+
+    private func updateTopEdge() {
+        guard !explicitlyHidden, !menuIsTracking else { return }
+        guard let screen = NSScreen.screens.max(by: {
+            let a = $0.visibleFrame.intersection(panel.frame)
+            let b = $1.visibleFrame.intersection(panel.frame)
+            return max(0, a.width) * max(0, a.height) < max(0, b.width) * max(0, b.height)
+        }) else { return }
+        let bounds = screen.visibleFrame
+        // Wait for the drag/resize to finish before changing window visibility.
+        guard NSEvent.pressedMouseButtons == 0, !panel.inLiveResize else {
+            pointerLeftAt = nil
+            return
+        }
+        if !edgeCollapsed {
+            guard panel.isVisible else { return }
+            if abs(panel.frame.maxY - bounds.maxY) <= 12 {
+                topDocked = true
+            } else if abs(panel.frame.maxY - bounds.maxY) > 24 {
+                topDocked = false
+            }
+        }
+        guard topDocked else { pointerLeftAt = nil; return }
+        let mouse = NSEvent.mouseLocation
+        let handleWidth = min(100, bounds.width)
+        let handleX = min(max(panel.frame.midX - handleWidth / 2, bounds.minX), bounds.maxX - handleWidth)
+        let handleFrame = NSRect(x: handleX, y: bounds.maxY - 6, width: handleWidth, height: 6)
+        edgeHandle.setFrame(handleFrame, display: false)
+        if edgeCollapsed {
+            // The small visible grip remains reachable below the menu bar.
+            edgeHandle.orderFrontRegardless()
+            if handleFrame.insetBy(dx: -8, dy: -3).contains(mouse) {
+                var frame = panel.frame
+                frame.origin.x = min(max(frame.minX, bounds.minX), bounds.maxX - frame.width)
+                frame.origin.y = bounds.maxY - frame.height
+                panel.setFrame(frame, display: true)
+                edgeHandle.orderOut(nil)
+                edgeCollapsed = false
+                pointerLeftAt = nil
+                panel.orderFrontRegardless()
+            }
+        } else if panel.frame.insetBy(dx: -8, dy: -8).contains(mouse)
+                    || panel.attachedSheet != nil || NSApp.modalWindow != nil {
+            pointerLeftAt = nil
+        } else if let leftAt = pointerLeftAt {
+            if Date().timeIntervalSince(leftAt) >= 0.65 {
+                edgeCollapsed = true
+                panel.orderOut(nil)
+                edgeHandle.orderFrontRegardless()
+                pointerLeftAt = nil
+            }
+        } else {
+            pointerLeftAt = Date()
+        }
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        hideBoard()
+        return false
+    }
+
+    func applicationDidChangeScreenParameters(_ notification: Notification) {
+        // Recover a reachable full window after monitors or their layout change.
+        edgeHandle.orderOut(nil)
+        edgeCollapsed = false
+        topDocked = false
+        pointerLeftAt = nil
+        guard let bounds = (panel.screen ?? NSScreen.main)?.visibleFrame else { return }
+        var frame = panel.frame
+        frame.size.width = min(frame.width, bounds.width)
+        frame.size.height = min(frame.height, bounds.height)
+        frame.origin.x = min(max(frame.minX, bounds.minX), bounds.maxX - frame.width)
+        frame.origin.y = min(max(frame.minY, bounds.minY), bounds.maxY - frame.height)
+        panel.setFrame(frame, display: true)
+        if !explicitlyHidden { panel.orderFrontRegardless() }
+    }
+
     private let model = BoardModel()
     private var panel: NSPanel!
     private var statusItem: NSStatusItem!
@@ -1881,6 +2115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.contentView = NSHostingView(rootView: BoardView(model: model))
         panel.isReleasedWhenClosed = false
         panel.makeKeyAndOrderFront(nil)
+        setupTopEdge()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "circle.dotted", accessibilityDescription: "Orbit")
@@ -1918,10 +2153,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showBoard() {
+        explicitlyHidden = false
+        edgeCollapsed = false
+        edgeHandle.orderOut(nil)
+        pointerLeftAt = Date().addingTimeInterval(1)
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
-    @objc private func hideBoard() { panel.orderOut(nil) }
+    @objc private func hideBoard() {
+        explicitlyHidden = true
+        edgeCollapsed = false
+        edgeHandle.orderOut(nil)
+        panel.orderOut(nil)
+    }
     @objc private func quit() { NSApp.terminate(nil) }
 }
 
@@ -1975,6 +2219,92 @@ if CommandLine.arguments.contains("--cursor-scan") {
     precondition(restored.visibleChildren(of: first.id).contains { $0.codexThreadID == threadID })
     precondition(restored.visibleChildren(of: second.id).contains { $0.codexThreadID == threadID })
     print("Codex recent self-test passed")
+} else if CommandLine.arguments.contains("--qoder-terminal-self-test") {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-terminal-test-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let project = directory.appendingPathComponent("项目 ' $(touch ORBIT_UNEXPECTED_FILE)")
+    try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+    let output = directory.appendingPathComponent("arguments")
+    let cli = directory.appendingPathComponent("fake cli ' binary")
+    try ("#!/bin/zsh\n/usr/bin/printf '%s\\0' \"$@\" > " + QoderTerminalLauncher.shellQuote(output.path) + "\n")
+        .write(to: cli, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: cli.path)
+    let file = directory.appendingPathComponent("launch.command")
+    let script = try QoderTerminalLauncher.script(executable: cli, project: project.path, sessionID: "test-session_123")
+    try script.write(to: file, atomically: true, encoding: .utf8)
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+    process.arguments = [file.path]
+    process.currentDirectoryURL = directory
+    try process.run()
+    process.waitUntilExit()
+    precondition(process.terminationStatus == 0)
+    let args = try Data(contentsOf: output).split(separator: 0).map { String(decoding: $0, as: UTF8.self) }
+    precondition(args == ["--cwd", project.path, "--resume", "test-session_123"])
+    precondition(!FileManager.default.fileExists(atPath: directory.appendingPathComponent("ORBIT_UNEXPECTED_FILE").path))
+    precondition(!FileManager.default.fileExists(atPath: file.path))
+    for id in ["", "--help", "bad;command", "bad\n"] {
+        do {
+            _ = try QoderTerminalLauncher.script(executable: cli, project: project.path, sessionID: id)
+            preconditionFailure("Invalid session ID accepted")
+        } catch QoderTerminalLauncher.LaunchError.invalidSession { }
+    }
+    do {
+        _ = try QoderTerminalLauncher.script(executable: cli, project: directory.appendingPathComponent("missing").path, sessionID: "test")
+        preconditionFailure("Missing project accepted")
+    } catch QoderTerminalLauncher.LaunchError.missingProject { }
+    print("Qoder terminal self-test passed")
+} else if CommandLine.arguments.contains("--qoder-resume-self-test") {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-qoder-resume-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let root = directory.appendingPathComponent("projects")
+    let project = root.appendingPathComponent("example")
+    try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+    let transcript = project.appendingPathComponent("session.jsonl")
+    func userRecord(_ prompt: String, at date: Date) throws -> String {
+        let object: [String: Any] = ["type": "user", "sessionId": "resume-test", "cwd": "/tmp/example",
+                                    "timestamp": ISO8601DateFormatter().string(from: date),
+                                    "message": ["content": [["type": "text", "text": prompt]]]]
+        return String(data: try JSONSerialization.data(withJSONObject: object), encoding: .utf8)! + "\n"
+    }
+    let old = try userRecord("旧问题", at: Date().addingTimeInterval(-120))
+    try old.write(to: transcript, atomically: true, encoding: .utf8)
+    let model = BoardModel(dataDirectory: directory)
+    model.pollQoderTranscripts(root: root)
+    let id = model.tasks.first { $0.qoderSessionID == "resume-test" }!.id
+    model.setState(id, to: .done)
+    model.update(id) { $0.stateSince = Date().addingTimeInterval(-60) }
+    // Unrelated transcript growth must preserve a manual completion.
+    try (old + "{\"type\":\"active-leaf\"}\n").write(to: transcript, atomically: true, encoding: .utf8)
+    model.pollQoderTranscripts(root: root)
+    precondition(model.tasks.first { $0.id == id }!.state == .done)
+    let new = try userRecord("新问题", at: Date().addingTimeInterval(-1))
+    try (old + new).write(to: transcript, atomically: true, encoding: .utf8)
+    // Same record count still needs to recover the previously stuck completed task.
+    model.pollQoderTranscripts(root: root)
+    precondition(model.tasks.first { $0.id == id }!.state == .waiting)
+    precondition(model.tasks.first { $0.id == id }!.lastUserPreview == "新问题")
+    model.setState(id, to: .done)
+    model.pollQoderTranscripts(root: root)
+    precondition(model.tasks.first { $0.id == id }!.state == .done)
+    let suite = "orbit-qoder-test-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    model.update(id) { $0.stateSince = Date().addingTimeInterval(-60) }
+    let event: [String: String] = ["session_id": "resume-test", "hook_event_name": "UserPromptSubmit",
+                                   "cwd": "/tmp/example", "prompt_preview": "Hook 新问题",
+                                   "timestamp": ISO8601DateFormatter().string(from: Date())]
+    var data = try JSONSerialization.data(withJSONObject: event)
+    data.append(0x0a)
+    try data.write(to: directory.appendingPathComponent("qoder-events.jsonl"))
+    defaults.set(500, forKey: "qoderEventLineCount")
+    model.pollQoder(defaults: defaults)
+    precondition(model.tasks.first { $0.id == id }!.state == .waiting)
+    precondition(model.tasks.first { $0.id == id }!.lastUserPreview == "Hook 新问题")
+    precondition(defaults.integer(forKey: "qoderEventLineCount") == 1)
+    print("Qoder resume self-test passed")
 } else if CommandLine.arguments.contains("--human-state-self-test") {
     precondition(HumanActionDetector.needsHuman("需要你确认项目目录后我才能继续。"))
     precondition(HumanActionDetector.needsHuman("Please run the command and share its output."))

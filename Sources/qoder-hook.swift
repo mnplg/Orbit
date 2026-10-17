@@ -13,7 +13,10 @@ let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .u
     .appendingPathComponent("DeskFocusBoard", isDirectory: true)
 try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
 let path = support.appendingPathComponent("qoder-events.jsonl").path
-var event: [String: String] = ["session_id": sessionID, "hook_event_name": eventName]
+let timestampFormatter = ISO8601DateFormatter()
+timestampFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+var event: [String: String] = ["session_id": sessionID, "hook_event_name": eventName,
+                                "timestamp": timestampFormatter.string(from: Date())]
 if let cwd = object["cwd"] as? String { event["cwd"] = cwd }
 if eventName == "UserPromptSubmit", let prompt = object["prompt"] as? String {
     event["prompt_preview"] = String(prompt.replacingOccurrences(of: "\n", with: " ").prefix(90))

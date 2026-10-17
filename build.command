@@ -23,7 +23,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict></plist>
 PLIST
 
-swiftc -framework AppKit -framework SwiftUI "$ROOT/Sources/main.swift" -o "$APP/Contents/MacOS/DeskFocusBoard"
+swiftc -framework AppKit -framework SwiftUI "$ROOT/Sources/main.swift" "$ROOT/Sources/QoderDesktopNavigator.swift" -o "$APP/Contents/MacOS/DeskFocusBoard"
 swiftc -O "$ROOT/Sources/qoder-hook.swift" -o "$APP/Contents/MacOS/QoderHook"
 cp "$ROOT/Assets/starlight-mascot.png" "$APP/Contents/Resources/starlight-mascot.png"
 cp "$ROOT/Assets/starlight-clouds.png" "$APP/Contents/Resources/starlight-clouds.png"
