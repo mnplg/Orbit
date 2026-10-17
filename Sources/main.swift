@@ -337,6 +337,7 @@ struct QoderSession {
     let projectKey: String
     let projectTitle: String
     let lastPromptAt: Date?
+    let wasInterrupted: Bool
 }
 
 enum QoderReader {
@@ -368,6 +369,7 @@ enum QoderReader {
                 var lastPrompt = -1
                 var lastCompletion = -1
                 var lastCompletionText = ""
+                var lastInterruption = -1
                 var sessionID: String? = nil
                 var cwd: String? = nil
                 for (index, event) in events.enumerated() {
@@ -379,6 +381,10 @@ enum QoderReader {
                         let prompt = content.filter { ($0["type"] as? String) == "text" }
                             .compactMap { $0["text"] as? String }.joined(separator: " ")
                             .trimmingCharacters(in: .whitespacesAndNewlines)
+                        if prompt == "[Request interrupted by user]" || prompt == "[Request interrupted by user for tool use]" {
+                            lastInterruption = index
+                            continue
+                        }
                         if !prompt.isEmpty {
                             if title == nil { title = String(prompt.prefix(90)) }
                             lastInput = prompt
@@ -400,12 +406,14 @@ enum QoderReader {
                 let projectTitle = sessionID.hasPrefix(leaf) ? "Qoder · \(title)" : leaf
                 found.append(QoderSession(id: sessionID, title: title,
                                           lastUserPreview: userInputPreview(lastInput),
-                                          state: lastCompletion > lastPrompt
-                                              ? (HumanActionDetector.needsHuman(lastCompletionText) ? .human : .ready)
-                                              : .waiting,
+                                          state: lastInterruption > max(lastPrompt, lastCompletion) ? .ready
+                                              : lastCompletion > lastPrompt
+                                                  ? (HumanActionDetector.needsHuman(lastCompletionText) ? .human : .ready)
+                                                  : .waiting,
                                           lineCount: events.count, modified: modified,
                                           projectKey: projectPath, projectTitle: projectTitle,
-                                          lastPromptAt: lastPromptAt))
+                                          lastPromptAt: lastPromptAt,
+                                          wasInterrupted: lastInterruption > max(lastPrompt, lastCompletion)))
             }
         }
         return found.sorted { $0.modified > $1.modified }
@@ -652,85 +660,6 @@ enum CodexReader {
     }
 }
 
-enum QoderTerminalLauncher {
-    enum LaunchError: LocalizedError {
-        case missingCLI, missingProject, invalidSession, missingTerminal
-        var errorDescription: String? {
-            switch self {
-            case .missingCLI: return "未找到 Qoder CLI。请先安装官方 CLI，再重试。"
-            case .missingProject: return "此会话的本地项目目录不存在，无法在正确的目录恢复。"
-            case .invalidSession: return "此会话没有有效的 Qoder 会话 ID。"
-            case .missingTerminal: return "未找到 macOS 终端应用。"
-            }
-        }
-    }
-
-    static func executable() -> URL? {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let candidates = [home.appendingPathComponent(".local/bin/qodercli"),
-                          home.appendingPathComponent(".qoder/bin/qodercli/qodercli")]
-            + (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":")
-                .map { URL(fileURLWithPath: String($0)).appendingPathComponent("qodercli") }
-        return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
-    }
-
-    static func shellQuote(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
-    }
-
-    static func script(executable: URL, project: String, sessionID: String) throws -> String {
-        guard let match = sessionID.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$", options: .regularExpression),
-              match == sessionID.startIndex..<sessionID.endIndex else {
-            throw LaunchError.invalidSession
-        }
-        var isDirectory: ObjCBool = false
-        guard project.hasPrefix("/"),
-              FileManager.default.fileExists(atPath: project, isDirectory: &isDirectory), isDirectory.boolValue else {
-            throw LaunchError.missingProject
-        }
-        // Quote each argument separately: project names are data, never shell code.
-        let command = [executable.path, "--cwd", project, "--resume", sessionID].map(shellQuote).joined(separator: " ")
-        return "#!/bin/zsh\n# Orbit: resume an existing Qoder session without submitting a prompt.\n"
-            + "trap '/bin/rm -f -- \"$0\"' EXIT\n"
-            + command + "\nresult=$?\n"
-            + "if (( result != 0 )); then\n  print 'Qoder CLI 未能恢复会话，请查看上方提示。'\nfi\nexit $result\n"
-    }
-
-    static func launch(project: String, sessionID: String) throws {
-        guard let cli = executable() else { throw LaunchError.missingCLI }
-        let contents = try script(executable: cli, project: project, sessionID: sessionID)
-        guard let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") else {
-            throw LaunchError.missingTerminal
-        }
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-terminal-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
-                                               attributes: [.posixPermissions: 0o700])
-        let file = directory.appendingPathComponent("恢复 Qoder 会话.command")
-        do {
-            try contents.write(to: file, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: file.path)
-        } catch {
-            try? FileManager.default.removeItem(at: directory)
-            throw error
-        }
-        NSWorkspace.shared.open([file], withApplicationAt: terminal,
-                                configuration: NSWorkspace.OpenConfiguration()) { _, error in
-            if let error {
-                try? FileManager.default.removeItem(at: directory)
-                DispatchQueue.main.async { showError(error) }
-            }
-        }
-    }
-
-    static func showError(_ error: Error) {
-        let alert = NSAlert()
-        alert.messageText = "无法在终端恢复 Qoder 会话"
-        alert.informativeText = error.localizedDescription
-        alert.addButton(withTitle: "知道了")
-        alert.runModal()
-    }
-}
-
 final class BoardModel: ObservableObject {
     @Published var tasks: [BoardTask] = [] {
         didSet { save() }
@@ -750,7 +679,24 @@ final class BoardModel: ObservableObject {
         qoderEventsURL = support.appendingPathComponent("qoder-events.jsonl")
         if let data = try? Data(contentsOf: fileURL),
            let saved = try? JSONDecoder().decode([BoardTask].self, from: data) {
-            tasks = saved
+            let repaired = Self.normalizedAutoGroups(saved)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            if (try? encoder.encode(saved)) != (try? encoder.encode(repaired)) {
+                let backup = support.appendingPathComponent("tasks-before-auto-group-repair.json")
+                do {
+                    if !FileManager.default.fileExists(atPath: backup.path) {
+                        try FileManager.default.copyItem(at: fileURL, to: backup)
+                    }
+                    tasks = repaired
+                    save()
+                } catch {
+                    // Keep original ownership if a recovery copy cannot be created.
+                    tasks = saved
+                }
+            } else {
+                tasks = saved
+            }
         } else if FileManager.default.fileExists(atPath: fileURL.path) {
             let recovery = support.appendingPathComponent("tasks-unreadable-recovery.json")
             if !FileManager.default.fileExists(atPath: recovery.path) {
@@ -921,21 +867,83 @@ final class BoardModel: ObservableObject {
             .sorted { $0.createdAt > $1.createdAt }
     }
 
+    /// Consolidate only automatic ownership; explicit manual bindings remain intact.
+    static func normalizedAutoGroups(_ original: [BoardTask]) -> [BoardTask] {
+        var result = original
+        let automatic = original.filter { $0.isAutoGroup && !$0.isConversation && $0.projectKey?.isEmpty == false }
+        let oldIDs = Set(automatic.map(\.id))
+        var byKey = Dictionary(grouping: automatic, by: { $0.projectKey! })
+        for child in original where child.isConversation {
+            guard let parent = child.parentID, oldIDs.contains(parent),
+                  let key = child.projectKey, !key.isEmpty, byKey[key] == nil else { continue }
+            var group = BoardTask(title: URL(fileURLWithPath: key).lastPathComponent)
+            group.projectKey = key
+            group.isAutoGroup = true
+            group.createdAt = child.createdAt
+            group.lastActivityAt = child.lastActivityAt
+            group.state = child.state
+            byKey[key] = [group]
+            result.append(group)
+        }
+        var destinations: [String: UUID] = [:]
+        var replacements: [UUID: UUID] = [:]
+        var removed = Set<UUID>()
+        for key in byKey.keys.sorted() {
+            let groups = byKey[key]!.sorted {
+                if ($0.state == .done) != ($1.state == .done) { return $0.state != .done }
+                if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
+                return $0.id.uuidString < $1.id.uuidString
+            }
+            let canonical = groups[0]
+            destinations[key] = canonical.id
+            for group in groups { replacements[group.id] = canonical.id }
+            guard let index = result.firstIndex(where: { $0.id == canonical.id }) else { continue }
+            result[index].title = URL(fileURLWithPath: key).lastPathComponent
+            result[index].isPinned = groups.contains { $0.isPinned }
+            for group in groups.dropFirst() {
+                removed.insert(group.id)
+                // Preserve any notes or saved links on a merged automatic group.
+                for note in [group.nextStep, group.link] where !note.isEmpty {
+                    if !result[index].nextStep.contains(note) {
+                        result[index].nextStep += (result[index].nextStep.isEmpty ? "" : "\n") + note
+                    }
+                }
+            }
+        }
+        for index in result.indices where result[index].isConversation {
+            if let parent = result[index].parentID, oldIDs.contains(parent),
+               let key = result[index].projectKey, let destination = destinations[key] {
+                result[index].parentID = destination
+            }
+            var seen = Set<UUID>()
+            result[index].boundParentIDs = result[index].boundParentIDs
+                .map { replacements[$0] ?? $0 }
+                .filter { $0 != result[index].parentID && seen.insert($0).inserted }
+        }
+        result.removeAll { removed.contains($0.id) }
+        return result
+    }
+
     private func ensureProjectParent(for childID: UUID, key: String, title: String) {
-        guard let child = tasks.first(where: { $0.id == childID }), child.parentID == nil && child.boundParentIDs.isEmpty else { return }
+        guard !key.isEmpty, let child = tasks.first(where: { $0.id == childID }) else { return }
+        if let parentID = child.parentID,
+           let parent = tasks.first(where: { $0.id == parentID }), !parent.isAutoGroup { return }
+        if child.parentID == nil && !child.boundParentIDs.isEmpty { return }
         let parentID: UUID
-        if let existing = tasks.first(where: { $0.parentID == nil && !$0.isConversation && $0.projectKey == key && $0.state != .done }) {
+        if let existing = tasks.first(where: { $0.isAutoGroup && !$0.isConversation && $0.projectKey == key }) {
             parentID = existing.id
         } else {
-            var parent = BoardTask(title: title.isEmpty ? "未命名项目" : title)
+            var parent = BoardTask(title: URL(fileURLWithPath: key).lastPathComponent)
             parent.projectKey = key
             parent.isAutoGroup = true
             parentID = parent.id
             tasks.insert(parent, at: 0)
         }
-        update(childID) { task in
-            task.projectKey = key
-            task.parentID = parentID
+        if child.projectKey != key || child.parentID != parentID {
+            update(childID) { task in
+                task.projectKey = key
+                task.parentID = parentID
+            }
         }
     }
 
@@ -1006,15 +1014,6 @@ final class BoardModel: ObservableObject {
             target.codexThreadID != nil ? "com.openai.codex" :
                 (target.qoderSessionID == nil ? "com.todesktop.230313mzl4w4u92" : "com.qoder.app")) else { return }
         NSWorkspace.shared.openApplication(at: appURL, configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
-    }
-
-    func resumeQoderInTerminal(_ task: BoardTask) {
-        do {
-            guard let sessionID = task.qoderSessionID else { throw QoderTerminalLauncher.LaunchError.invalidSession }
-            try QoderTerminalLauncher.launch(project: task.projectKey ?? "", sessionID: sessionID)
-        } catch {
-            QoderTerminalLauncher.showError(error)
-        }
     }
 
     func isVisible(_ task: BoardTask, now: Date = Date()) -> Bool {
@@ -1143,17 +1142,15 @@ final class BoardModel: ObservableObject {
                     tasks[existing].projectKey = session.projectKey
                 }
                 ensureProjectParent(for: childID, key: session.projectKey, title: session.projectTitle)
-                if let parentIndex = tasks.firstIndex(where: { $0.projectKey == session.projectKey && !$0.isConversation }),
-                   [URL(fileURLWithPath: session.projectKey).lastPathComponent, session.title].contains(tasks[parentIndex].title) {
-                    tasks[parentIndex].title = session.projectTitle
-                }
                 guard let index = tasks.firstIndex(where: { $0.id == childID }) else { continue }
                 if tasks[index].lastUserPreview != session.lastUserPreview {
                     tasks[index].lastUserPreview = session.lastUserPreview
                 }
                 let hasNewPrompt = session.lastPromptAt.map { $0 > tasks[index].stateSince } ?? false
+                let missedInterruption = session.wasInterrupted && tasks[index].state == .waiting
+                    && tasks[index].lastActivityAt <= session.modified
                 guard session.lineCount != tasks[index].qoderObservedLines
-                        || (tasks[index].state == .done && hasNewPrompt) else { continue }
+                        || (tasks[index].state == .done && hasNewPrompt) || missedInterruption else { continue }
                 tasks[index].qoderObservedLines = session.lineCount
                 tasks[index].lastActivityAt = min(session.modified, Date())
                 if (tasks[index].state != .done || hasNewPrompt), tasks[index].state != session.state {
@@ -1637,6 +1634,18 @@ struct TaskCard: View {
                     .help("点击修改任务名称")
                 }
 
+                if !task.isConversation {
+                    Text(task.isAutoGroup ? "自动" : "手动")
+                        .font(.system(size: 8, weight: .medium))
+                        .foregroundStyle(theme.secondaryText)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 2)
+                        .background(theme.secondaryText.opacity(0.10), in: RoundedRectangle(cornerRadius: 3))
+                        .fixedSize()
+                        .help(task.isAutoGroup ? "根据本地项目会话自动生成的分组" : "手动创建的主体任务")
+                        .accessibilityLabel(task.isAutoGroup ? "自动分组" : "手动分组")
+                }
+
                 Button {
                     model.openConversation(for: task, now: now)
                 } label: {
@@ -1928,14 +1937,6 @@ struct SessionRow: View {
 
     private var sessionMenu: some View {
         VStack(alignment: .leading, spacing: 3) {
-            if task.qoderSessionID != nil {
-                Button("在终端恢复（CLI）") {
-                    menuOpen = false
-                    model.resumeQoderInTerminal(task)
-                }
-                .help("用 Qoder CLI 恢复此会话；首次使用可能需要登录或确认项目目录")
-                Divider()
-            }
             ForEach(TaskState.allCases) { state in
                 Button(state.rawValue) { model.setState(task.id, to: state); menuOpen = false }
             }
@@ -2219,42 +2220,59 @@ if CommandLine.arguments.contains("--cursor-scan") {
     precondition(restored.visibleChildren(of: first.id).contains { $0.codexThreadID == threadID })
     precondition(restored.visibleChildren(of: second.id).contains { $0.codexThreadID == threadID })
     print("Codex recent self-test passed")
-} else if CommandLine.arguments.contains("--qoder-terminal-self-test") {
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-terminal-test-\(UUID().uuidString)")
+} else if CommandLine.arguments.contains("--auto-group-repair-self-test") {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-group-repair-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
-    let project = directory.appendingPathComponent("项目 ' $(touch ORBIT_UNEXPECTED_FILE)")
-    try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
-    let output = directory.appendingPathComponent("arguments")
-    let cli = directory.appendingPathComponent("fake cli ' binary")
-    try ("#!/bin/zsh\n/usr/bin/printf '%s\\0' \"$@\" > " + QoderTerminalLauncher.shellQuote(output.path) + "\n")
-        .write(to: cli, atomically: true, encoding: .utf8)
-    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: cli.path)
-    let file = directory.appendingPathComponent("launch.command")
-    let script = try QoderTerminalLauncher.script(executable: cli, project: project.path, sessionID: "test-session_123")
-    try script.write(to: file, atomically: true, encoding: .utf8)
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-    process.arguments = [file.path]
-    process.currentDirectoryURL = directory
-    try process.run()
-    process.waitUntilExit()
-    precondition(process.terminationStatus == 0)
-    let args = try Data(contentsOf: output).split(separator: 0).map { String(decoding: $0, as: UTF8.self) }
-    precondition(args == ["--cwd", project.path, "--resume", "test-session_123"])
-    precondition(!FileManager.default.fileExists(atPath: directory.appendingPathComponent("ORBIT_UNEXPECTED_FILE").path))
-    precondition(!FileManager.default.fileExists(atPath: file.path))
-    for id in ["", "--help", "bad;command", "bad\n"] {
-        do {
-            _ = try QoderTerminalLauncher.script(executable: cli, project: project.path, sessionID: id)
-            preconditionFailure("Invalid session ID accepted")
-        } catch QoderTerminalLauncher.LaunchError.invalidSession { }
-    }
-    do {
-        _ = try QoderTerminalLauncher.script(executable: cli, project: directory.appendingPathComponent("missing").path, sessionID: "test")
-        preconditionFailure("Missing project accepted")
-    } catch QoderTerminalLauncher.LaunchError.missingProject { }
-    print("Qoder terminal self-test passed")
+    let key = directory.appendingPathComponent("project").path
+    let otherKey = directory.appendingPathComponent("other-project").path
+    var old = BoardTask(title: "旧自动名称")
+    old.projectKey = key; old.isAutoGroup = true; old.state = .done; old.isPinned = true
+    var current = BoardTask(title: "project")
+    current.projectKey = key; current.isAutoGroup = true
+    var manual = BoardTask(title: "手动分组")
+    manual.projectKey = key
+    var first = BoardTask(title: "已恢复的旧会话")
+    first.qoderSessionID = "repair-first"; first.projectKey = key; first.parentID = old.id
+    first.boundParentIDs = [manual.id]
+    var second = BoardTask(title: "新会话")
+    second.qoderSessionID = "repair-second"; second.projectKey = key; second.parentID = current.id
+    var misplaced = BoardTask(title: "另一个项目的会话")
+    misplaced.qoderSessionID = "repair-other"; misplaced.projectKey = otherKey; misplaced.parentID = old.id
+    var owned = BoardTask(title: "手动归属")
+    owned.qoderSessionID = "repair-manual"; owned.projectKey = key; owned.parentID = manual.id
+    owned.boundParentIDs = [old.id]
+    let original = [old,current,manual,first,second,misplaced,owned]
+    let repaired = BoardModel.normalizedAutoGroups(original)
+    precondition(repaired.filter { $0.isAutoGroup && $0.projectKey == key }.count == 1)
+    precondition(repaired.first { $0.id == first.id }!.parentID == current.id)
+    precondition(repaired.first { $0.id == second.id }!.parentID == current.id)
+    precondition(repaired.first { $0.id == first.id }!.boundParentIDs == [manual.id])
+    precondition(repaired.first { $0.id == owned.id }!.parentID == manual.id)
+    precondition(repaired.first { $0.id == owned.id }!.boundParentIDs == [current.id])
+    precondition(repaired.first { $0.id == current.id }!.isPinned)
+    let moved = repaired.first { $0.id == misplaced.id }!
+    precondition(repaired.first { $0.id == moved.parentID }!.projectKey == otherKey)
+    precondition(repaired.first { $0.id == manual.id }!.title == "手动分组")
+    let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+    let twice = BoardModel.normalizedAutoGroups(repaired)
+    let encodedOnce = try encoder.encode(repaired)
+    let encodedTwice = try encoder.encode(twice)
+    precondition(encodedOnce == encodedTwice)
+    let file = directory.appendingPathComponent("tasks.json")
+    try encoder.encode(original).write(to: file)
+    let model = BoardModel(dataDirectory: directory)
+    precondition(FileManager.default.fileExists(atPath: directory.appendingPathComponent("tasks-before-auto-group-repair.json").path))
+    precondition(model.tasks.filter { $0.isAutoGroup && $0.projectKey == key }.count == 1)
+    model.setState(current.id, to: .done)
+    let session = CursorSession(path: directory.appendingPathComponent("new.jsonl").path, title: "再次进入项目", lastUserPreview: "测试",
+                                modified: Date(), lineCount: 0, projectKey: key, projectTitle: "project")
+    model.importCursor(session)
+    precondition(model.tasks.filter { $0.isAutoGroup && $0.projectKey == key }.count == 1)
+    precondition(model.tasks.first { $0.cursorPath == session.path }!.parentID == current.id)
+    let restored = BoardModel(dataDirectory: directory)
+    precondition(restored.tasks.filter { $0.isAutoGroup && $0.projectKey == key }.count == 1)
+    print("Automatic group repair self-test passed")
 } else if CommandLine.arguments.contains("--qoder-resume-self-test") {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-qoder-resume-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -2289,6 +2307,26 @@ if CommandLine.arguments.contains("--cursor-scan") {
     model.setState(id, to: .done)
     model.pollQoderTranscripts(root: root)
     precondition(model.tasks.first { $0.id == id }!.state == .done)
+    let interrupted = try userRecord("[Request interrupted by user]", at: Date())
+    try (old + new + interrupted).write(to: transcript, atomically: true, encoding: .utf8)
+    let stoppedSession = QoderReader.sessions(root: root).first!
+    precondition(stoppedSession.wasInterrupted && stoppedSession.state == .ready)
+    precondition(stoppedSession.lastUserPreview == "新问题")
+    model.update(id) {
+        $0.state = .waiting
+        $0.qoderObservedLines = stoppedSession.lineCount
+        $0.lastActivityAt = stoppedSession.modified
+    }
+    model.pollQoderTranscripts(root: root)
+    precondition(model.tasks.first { $0.id == id }!.state == .ready)
+    model.setState(id, to: .done)
+    model.pollQoderTranscripts(root: root)
+    precondition(model.tasks.first { $0.id == id }!.state == .done)
+    let resumed = try userRecord("停止后继续", at: Date())
+    try (old + new + interrupted + resumed).write(to: transcript, atomically: true, encoding: .utf8)
+    let resumedSession = QoderReader.sessions(root: root).first!
+    precondition(!resumedSession.wasInterrupted && resumedSession.state == .waiting)
+    precondition(resumedSession.lastUserPreview == "停止后继续")
     let suite = "orbit-qoder-test-\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suite)!
     defer { defaults.removePersistentDomain(forName: suite) }

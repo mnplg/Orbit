@@ -19,7 +19,7 @@ final class QoderDesktopNavigator {
         var errorDescription: String? {
             switch self {
             case .permission: return "请在系统设置 → 隐私与安全性 → 辅助功能中允许 Orbit，然后再次点击会话。"
-            case .missingSession: return "Qoder 桌面版本机记录中没有找到此会话，无法确认目标。可使用会话菜单中的“在终端恢复（CLI）”。"
+            case .missingSession: return "Qoder 桌面版本机记录中没有找到此会话，无法确认目标。请先在 Qoder 中确认该会话仍然存在。"
             case .archivedSession: return "此会话已归档或删除，请先在 Qoder 中恢复它。"
             case .missingApp: return "未找到 Qoder 桌面版。"
             case .unavailableUI: return "未能在 Qoder 中定位或打开此会话。请确认主窗口可见；界面版本变化也可能影响定位。"
