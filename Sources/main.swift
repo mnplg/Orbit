@@ -508,6 +508,7 @@ enum CodexReader {
         let activity: Activity
     }
     private static var stateCache: [String: CachedState] = [:]
+    private static let stateQueue = DispatchQueue(label: "local.orbit.codex-state-cache")
 
     static func sessions(databaseURL: URL = databaseURL, now: Date = Date()) -> [CodexSession] {
         SyntheticAccess.check(databaseURL)
@@ -558,6 +559,10 @@ enum CodexReader {
     }
 
     private static func latestActivity(at path: String) -> Activity {
+        stateQueue.sync { latestActivityLocked(at: path) }
+    }
+
+    private static func latestActivityLocked(at path: String) -> Activity {
         SyntheticAccess.check(URL(fileURLWithPath: path))
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
               let size = attrs[.size] as? Int,
@@ -1305,6 +1310,7 @@ final class BoardModel: ObservableObject {
     }
 
     func mergeCodex(_ sessions: [CodexSession]) {
+        precondition(Thread.isMainThread, "Codex model merges must run on the main thread")
         for session in sessions {
             if let index = tasks.firstIndex(where: { $0.codexThreadID == session.id }) {
                 let childID = tasks[index].id
@@ -2394,7 +2400,23 @@ func runPersistenceSelfTest() throws {
     print("Persistence recovery self-test passed")
 }
 
-if CommandLine.arguments.contains("--persistence-self-test") {
+if CommandLine.arguments.contains("--cache-concurrency-self-test") {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-cache-" + UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let rollout = directory.appendingPathComponent("thread.jsonl")
+    let started = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n"
+    let completed = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n"
+    try started.write(to: rollout, atomically: true, encoding: .utf8)
+    DispatchQueue.concurrentPerform(iterations: 200) { _ in
+        precondition(CodexReader.recentActivity(at: rollout.path)?.0 == .waiting)
+    }
+    try (started + completed).write(to: rollout, atomically: true, encoding: .utf8)
+    DispatchQueue.concurrentPerform(iterations: 200) { _ in
+        precondition(CodexReader.recentActivity(at: rollout.path)?.0 == .ready)
+    }
+    print("Codex cache concurrency self-test passed")
+} else if CommandLine.arguments.contains("--persistence-self-test") {
     try runPersistenceSelfTest()
 } else if CommandLine.arguments.contains("--intentional-failure-self-test") {
     exit(42)
