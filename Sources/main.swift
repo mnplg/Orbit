@@ -1142,9 +1142,35 @@ final class BoardModel: ObservableObject {
         save()
     }
 
+    private func hasNavigationSource(_ task: BoardTask) -> Bool {
+        [task.cursorPath, task.qoderSessionID, task.codexThreadID].contains { $0?.isEmpty == false }
+    }
+
     func navigationTarget(for task: BoardTask, now: Date = Date()) -> BoardTask? {
-        if task.isConversation { return task }
-        return visibleChildren(of: task.id, now: now).first
+        guard let current = tasks.first(where: { $0.id == task.id }) else { return nil }
+        if current.isConversation {
+            return validatedNavigationTarget(current, for: task, now: now)
+        }
+        return visibleChildren(of: current.id, now: now).filter(hasNavigationSource).sorted {
+            if $0.isPinned != $1.isPinned { return $0.isPinned }
+            if $0.lastActivityAt != $1.lastActivityAt { return $0.lastActivityAt > $1.lastActivityAt }
+            return $0.id.uuidString < $1.id.uuidString
+        }.first
+    }
+
+    /// Recheck the selected identity and ownership without substituting another session.
+    func validatedNavigationTarget(_ selected: BoardTask, for owner: BoardTask, now: Date = Date()) -> BoardTask? {
+        guard let current = tasks.first(where: { $0.id == selected.id }), hasNavigationSource(current),
+              current.cursorPath == selected.cursorPath, current.qoderSessionID == selected.qoderSessionID,
+              current.codexThreadID == selected.codexThreadID,
+              let currentOwner = tasks.first(where: { $0.id == owner.id }) else { return nil }
+        if owner.isConversation {
+            guard current.id == owner.id, current.cursorPath == owner.cursorPath,
+                  current.qoderSessionID == owner.qoderSessionID, current.codexThreadID == owner.codexThreadID else { return nil }
+        } else {
+            guard !currentOwner.isConversation, current.belongs(to: owner.id), isVisible(current, now: now) else { return nil }
+        }
+        return current
     }
 
     func directURL(for task: BoardTask) -> URL? {
@@ -1156,7 +1182,8 @@ final class BoardModel: ObservableObject {
     }
 
     func openConversation(for task: BoardTask, now: Date = Date()) {
-        guard let target = navigationTarget(for: task, now: now) else { return }
+        guard let selected = navigationTarget(for: task, now: now),
+              let target = validatedNavigationTarget(selected, for: task, now: now) else { return }
         let trimmed = target.link.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty {
             guard let url = directURL(for: target), NSWorkspace.shared.open(url) else {
@@ -2433,7 +2460,35 @@ func runPersistenceSelfTest() throws {
     print("Persistence recovery self-test passed")
 }
 
-if CommandLine.arguments.contains("--completion-override-self-test") {
+if CommandLine.arguments.contains("--pinned-navigation-self-test") {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-navigation-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
+    let now = Date()
+    for index in 0..<3 {
+        model.mergeCodex([CodexSession(id: "navigation-\(index)", title: "会话\(index)", lastUserPreview: "", state: .ready,
+                                      modified: now.addingTimeInterval(Double(-index)), projectKey: directory.path, projectTitle: "project")])
+    }
+    let parent = model.tasks.first { $0.isAutoGroup }!
+    let newest = model.tasks.first { $0.codexThreadID == "navigation-0" }!
+    let older = model.tasks.first { $0.codexThreadID == "navigation-1" }!
+    let oldest = model.tasks.first { $0.codexThreadID == "navigation-2" }!
+    precondition(model.navigationTarget(for: parent, now: now)?.id == newest.id)
+    model.update(older.id) { $0.isPinned = true }
+    model.update(oldest.id) { $0.isPinned = true }
+    precondition(model.navigationTarget(for: parent, now: now)?.id == older.id)
+    model.update(oldest.id) { $0.lastActivityAt = older.lastActivityAt }
+    let stable = [older.id, oldest.id].sorted { $0.uuidString < $1.uuidString }.first!
+    precondition(model.navigationTarget(for: parent, now: now)?.id == stable)
+    let selected = model.navigationTarget(for: parent, now: now)!
+    model.assignParent(selected.id, to: nil)
+    precondition(model.validatedNavigationTarget(selected, for: parent, now: now) == nil)
+    model.remove(newest.id)
+    precondition(model.navigationTarget(for: newest, now: now) == nil)
+    for child in model.children(of: parent.id) { model.remove(child.id) }
+    precondition(model.navigationTarget(for: parent, now: now) == nil)
+    print("Pinned navigation self-test passed")
+} else if CommandLine.arguments.contains("--completion-override-self-test") {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-completion-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: directory) }
     let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
@@ -2842,7 +2897,7 @@ if CommandLine.arguments.contains("--completion-override-self-test") {
     precondition(model.visibleChildren(of: parent.id, now: now.addingTimeInterval(23 * 3600)).isEmpty)
     model.setPinned(oldID)
     precondition(model.visibleChildren(of: parent.id, now: now).first?.id == recentID)
-    precondition(model.navigationTarget(for: parent, now: now)?.id == recentID)
+    precondition(model.navigationTarget(for: parent, now: now)?.id == oldID)
     precondition(model.isVisible(parent, now: now.addingTimeInterval(8 * 86400)))
     model.setPinned(oldID)
     precondition(!model.isVisible(parent, now: now.addingTimeInterval(8 * 86400)))
