@@ -1254,11 +1254,6 @@ final class BoardModel: ObservableObject {
             guard let parent = tasks.first(where: { $0.id == parentID && $0.parentID == nil && !$0.isConversation && $0.state != .done }),
                   parent.projectKey == nil || parent.projectKey == child.projectKey else { return }
             if parent.projectKey == nil { update(parentID) { $0.projectKey = child.projectKey } }
-            if child.isPinned {
-                for index in tasks.indices where tasks[index].parentID == parentID {
-                    tasks[index].isPinned = false
-                }
-            }
         }
         update(childID) { task in
             task.parentID = parentID
@@ -1278,7 +1273,6 @@ final class BoardModel: ObservableObject {
             child.projectKey = recent.projectKey
             child.lastActivityAt = recent.modified
             child.state = .ready
-            child.isPinned = Date().timeIntervalSince(recent.modified) >= 24 * 3600
             child.boundParentIDs = [parentID]
             child.groupingMode = .manual
             tasks.insert(child, at: 0)
@@ -1303,7 +1297,6 @@ final class BoardModel: ObservableObject {
             guard !task.belongs(to: parentID) else { return }
             task.boundParentIDs.append(parentID)
             if task.parentID == nil { task.groupingMode = .manual }
-            if Date().timeIntervalSince(task.lastActivityAt) >= 24 * 3600 { task.isPinned = true }
         }
         save()
     }
@@ -1464,12 +1457,11 @@ final class BoardModel: ObservableObject {
 
     private func sessionOrder(_ lhs: BoardTask, _ rhs: BoardTask) -> Bool {
         if lhs.lastActivityAt != rhs.lastActivityAt { return lhs.lastActivityAt > rhs.lastActivityAt }
-        if lhs.isPinned != rhs.isPinned { return lhs.isPinned }
         return lhs.id.uuidString < rhs.id.uuidString
     }
 
     func visibleChildren(of id: UUID, now: Date = Date()) -> [BoardTask] {
-        children(of: id).filter { $0.isPinned || now.timeIntervalSince($0.lastActivityAt) < 24 * 3600 }
+        children(of: id).filter { now.timeIntervalSince($0.lastActivityAt) < 24 * 3600 }
     }
 
     func latestActivityDate(for task: BoardTask, now: Date = Date()) -> Date {
@@ -1477,34 +1469,8 @@ final class BoardModel: ObservableObject {
         return visibleChildren(of: task.id, now: now).map(\.lastActivityAt).max() ?? task.lastActivityAt
     }
 
-    /// One shared conversation identity, without changing any sibling or owner star.
-    @discardableResult
-    func setSessionRetained(_ id: UUID, to retained: Bool, now: Date = Date(),
-                            confirmHiding: () -> Bool) -> Bool {
-        guard let target = tasks.first(where: { $0.id == id }), target.isConversation,
-              target.isPinned != retained else { return false }
-        var candidate = target
-        candidate.isPinned = retained
-        if !retained && !isVisible(candidate, now: now) && !confirmHiding() { return false }
-        // A modal confirmation can run the event loop; resolve identity again afterwards.
-        guard let index = tasks.firstIndex(where: { $0.id == id && $0.isConversation }) else { return false }
-        var updated = tasks
-        updated[index].isPinned = retained
-        tasks = updated
-        return true
-    }
-
-    func setPinned(_ id: UUID) {
-        guard let target = tasks.first(where: { $0.id == id }), target.isConversation else { return }
-        let nextValue = !target.isPinned
-        for index in tasks.indices where tasks[index].isConversation &&
-            (target.parentID == nil ? tasks[index].id == id : tasks[index].parentID == target.parentID) {
-            tasks[index].isPinned = nextValue && tasks[index].id == id
-        }
-    }
-
     func toggleTaskStar(_ id: UUID) {
-        guard let index = tasks.firstIndex(where: { $0.id == id }) else { return }
+        guard let index = tasks.firstIndex(where: { $0.id == id && !$0.isConversation }) else { return }
         tasks[index].isPinned.toggle()
         save()
     }
@@ -1519,7 +1485,6 @@ final class BoardModel: ObservableObject {
             return validatedNavigationTarget(current, for: task, now: now)
         }
         return visibleChildren(of: current.id, now: now).filter(hasNavigationSource).sorted {
-            if $0.isPinned != $1.isPinned { return $0.isPinned }
             if $0.lastActivityAt != $1.lastActivityAt { return $0.lastActivityAt > $1.lastActivityAt }
             return $0.id.uuidString < $1.id.uuidString
         }.first
@@ -1573,10 +1538,9 @@ final class BoardModel: ObservableObject {
     }
 
     func isVisible(_ task: BoardTask, now: Date = Date()) -> Bool {
-        if task.isConversation { return task.isPinned || now.timeIntervalSince(task.lastActivityAt) < 24 * 3600 }
+        if task.isConversation { return now.timeIntervalSince(task.lastActivityAt) < 24 * 3600 }
         guard task.isAutoGroup else { return true }
         let sessions = children(of: task.id)
-        if sessions.contains(where: \.isPinned) { return true }
         guard let latest = sessions.map(\.lastActivityAt).max() else { return true }
         return now.timeIntervalSince(latest) < 7 * 24 * 3600
     }
@@ -1922,7 +1886,6 @@ struct BoardView: View {
     @State private var showCompleted = false
     @State private var showNewTaskField = false
     @State private var showStarredOnly = false
-    @State private var showHiddenRecovery = false
     @State private var now = Date()
 
     private var skin: BoardSkin { BoardSkin(rawValue: skinRaw) ?? .midnight }
@@ -2001,7 +1964,6 @@ struct BoardView: View {
         .preferredColorScheme(theme.isLight ? .light : .dark)
         .environment(\.boardTheme, theme)
         .onReceive(Timer.publish(every: 30, on: .main, in: .common).autoconnect()) { now = $0 }
-        .sheet(isPresented: $showHiddenRecovery) { HiddenRecoverySheet(model: model, now: now) }
     }
 
     private var header: some View {
@@ -2145,9 +2107,6 @@ struct BoardView: View {
             Circle().fill(theme.stateTint(.waiting)).frame(width: 6, height: 6)
             Text("等待会话 \(model.tasks.filter { $0.isConversation && $0.state == .waiting && model.isVisible($0, now: now) }.count)")
             Spacer()
-            Button("找回已隐藏事项") { showHiddenRecovery = true }
-                .buttonStyle(.plain)
-                .help("隐藏不等于删除；查看隐藏原因并保留显示")
         }
         .font(.system(size: 10, weight: .medium))
         .foregroundStyle(theme.secondaryText)
@@ -2167,7 +2126,6 @@ struct TaskCard: View {
     @State private var binding = false
     @State private var bindingSearch = ""
     @State private var menuOpen = false
-    @State private var detailTask: BoardTask?
 
     private var displayState: TaskState { model.displayState(for: task, now: now) }
     private var stateColor: Color { theme.stateTint(displayState) }
@@ -2278,18 +2236,16 @@ struct TaskCard: View {
                 .help("打开对应会话")
 
                 VStack(spacing: 2) {
-                    Button {
-                        if task.isConversation {
-                            model.setSessionRetained(task.id, to: !task.isPinned, confirmHiding: SessionRetentionPrompt.confirmHiding)
-                        } else { model.toggleTaskStar(task.id) }
-                    } label: {
-                        Image(systemName: task.isPinned ? "star.fill" : "star")
-                            .foregroundStyle(task.isPinned ? theme.accent : theme.secondaryText)
-                            .frame(width: 28, height: 25)
-                            .contentShape(Rectangle())
+                    if !task.isConversation {
+                        Button { model.toggleTaskStar(task.id) } label: {
+                            Image(systemName: task.isPinned ? "star.fill" : "star")
+                                .foregroundStyle(task.isPinned ? theme.accent : theme.secondaryText)
+                                .frame(width: 28, height: 25)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help(task.isPinned ? "取消主体任务星标" : "星标主体任务")
                     }
-                    .buttonStyle(.plain)
-                    .help(task.isConversation ? (task.isPinned ? "取消保留显示" : "保留显示") : (task.isPinned ? "取消主体任务星标" : "星标主体任务"))
                     if previewSession != nil {
                         Text(sourceLabel)
                             .font(.system(size: 8, weight: .medium))
@@ -2360,7 +2316,6 @@ struct TaskCard: View {
         }
         .overlay(RoundedRectangle(cornerRadius: 13).stroke(theme.border.opacity(0.55)))
         .shadow(color: theme.isLight ? Color(red: 0.32, green: 0.45, blue: 0.65).opacity(0.10) : theme.accent.opacity(0.13), radius: 10, y: 3)
-        .sheet(item: $detailTask) { item in TaskDetailsSheet(task: item, model: model) }
     }
 
     private func beginTitleEdit() {
@@ -2383,8 +2338,6 @@ struct TaskCard: View {
 
     private var taskMenu: some View {
         VStack(alignment: .leading, spacing: 3) {
-            Button("查看完整详情") { detailTask = task; menuOpen = false }
-            Divider()
             if !task.isConversation && task.completionOverride {
                 Button("重新打开主体") { model.setState(task.id, to: .working); menuOpen = false }
             }
@@ -2400,7 +2353,6 @@ struct TaskCard: View {
                 }
             }
             if task.isConversation {
-                SessionRetentionButton(id: task.id, model: model) { menuOpen = false }
                 if task.groupingMode != .auto {
                     Button("恢复自动归组") { model.restoreAutomaticGrouping(task.id); menuOpen = false }
                 }
@@ -2466,7 +2418,7 @@ struct TaskCard: View {
                                         Text(candidate.title)
                                             .lineLimit(1)
                                         Text(isRecentCodex ? "Codex 最近 · \(projectName)" :
-                                             "\(candidate.sourceName) · \(candidate.isPinned ? "已保留" : candidate.state.rawValue)")
+                                             "\(candidate.sourceName) · \(candidate.state.rawValue)")
                                             .font(.system(size: 9))
                                             .foregroundStyle(theme.secondaryText)
                                     }
@@ -2481,10 +2433,6 @@ struct TaskCard: View {
                             .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(theme.primaryText.opacity(0.9))
                             .help("\(candidate.sourceName) · \(candidate.title)\n\(candidate.projectKey ?? "")")
-                            Button { detailTask = candidate } label: { Image(systemName: "info.circle").frame(width: 26, height: 30) }
-                                .buttonStyle(.plain)
-                                .help("查看完整详情，不绑定会话")
-                                .accessibilityLabel("查看完整详情：\(candidate.title)")
                             }
                         }
                     }
@@ -2507,7 +2455,6 @@ struct SessionRow: View {
     let showSource: Bool
     @Environment(\.boardTheme) private var theme
     @State private var menuOpen = false
-    @State private var detailTask: BoardTask?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -2563,7 +2510,6 @@ struct SessionRow: View {
             }
         }
         .padding(.vertical, 3)
-        .sheet(item: $detailTask) { item in TaskDetailsSheet(task: item, model: model) }
     }
 
     private var relativeTime: String {
@@ -2576,9 +2522,6 @@ struct SessionRow: View {
 
     private var sessionMenu: some View {
         VStack(alignment: .leading, spacing: 3) {
-            Button("查看完整详情") { detailTask = task; menuOpen = false }
-            SessionRetentionButton(id: task.id, model: model) { menuOpen = false }
-            Divider()
             ForEach(TaskState.allCases) { state in
                 Button(state.rawValue) { model.setState(task.id, to: state); menuOpen = false }
             }
@@ -2599,34 +2542,6 @@ struct SessionRow: View {
         .padding(8)
         .frame(minWidth: 150, alignment: .leading)
         .background(theme.panel)
-    }
-}
-
-enum SessionRetentionPrompt {
-    static func confirmHiding() -> Bool {
-        let alert = NSAlert()
-        alert.messageText = "取消保留后，此会话将从看板隐藏"
-        alert.informativeText = "记录不会删除，可从窗口底部的“找回已隐藏事项”再次保留显示。共享此会话的其他主体也会同步隐藏它。"
-        let cancel = alert.addButton(withTitle: "取消")
-        cancel.keyEquivalent = "\u{1b}"
-        alert.window.defaultButtonCell = cancel.cell as? NSButtonCell
-        alert.addButton(withTitle: "取消保留显示").keyEquivalent = ""
-        NSApp.activate(ignoringOtherApps: true)
-        return alert.runModal() == .alertSecondButtonReturn
-    }
-}
-
-/// Both standalone cards and grouped rows use the same retention action and confirmation.
-struct SessionRetentionButton: View {
-    let id: UUID
-    @ObservedObject var model: BoardModel
-    var closeMenu: () -> Void
-    private var retained: Bool { model.tasks.first { $0.id == id }?.isPinned ?? false }
-    var body: some View {
-        Button(retained ? "取消保留显示" : "保留显示") {
-            closeMenu()
-            model.setSessionRetained(id, to: !retained, confirmHiding: SessionRetentionPrompt.confirmHiding)
-        }
     }
 }
 
@@ -3225,11 +3140,11 @@ func runDisplayClockSelfTest() throws {
         precondition(model.displayState(for: owner, now: now) == .waiting)
         precondition(model.summarySessionCount(for: owner, now: now) == 0)
     }
-    model.setPinned(human.id)
+    model.update(human.id) { $0.isPinned = true }
     let future = activity.addingTimeInterval(8 * 86400)
-    precondition(model.active(now: future).contains { $0.id == owner.id })
-    precondition(model.displayState(for: owner, now: future) == .human)
-    precondition(model.summarySessionCount(for: owner, now: future) == 1)
+    precondition(!model.active(now: future).contains { $0.id == owner.id })
+    precondition(model.displayState(for: owner, now: future) == .waiting)
+    precondition(model.summarySessionCount(for: owner, now: future) == 0)
     // An older UI tick is intentionally independent of actual wall time.
     let priorTick = activity.addingTimeInterval(86399)
     precondition(model.displayState(for: owner, now: priorTick) == .human)
@@ -3414,125 +3329,14 @@ func runTerminationProtectionSelfTest() throws {
     print("Termination protection self-test passed (production coordinator; native dialogs untested)")
 }
 
-func runSessionRetentionSelfTest() throws {
-    let fixtureBase = ProcessInfo.processInfo.environment["ORBIT_SYNTHETIC_ROOT"]
-        .map { URL(fileURLWithPath: $0, isDirectory: true) } ?? FileManager.default.temporaryDirectory
-    let dir = fixtureBase.appendingPathComponent("orbit-retention-" + UUID().uuidString)
-    defer { try? FileManager.default.removeItem(at: dir) }
-    var fail = false
-    let model = BoardModel(dataDirectory: dir, sources: .synthetic(dir), storageFault: { point in
-        if fail && point == "write" { throw NSError(domain: "SyntheticRetention", code: 1) }
-    })
-    let now = Date(timeIntervalSince1970: 2_000_000_000)
-    var parent = BoardTask(title: dir.lastPathComponent); parent.isAutoGroup = true; parent.projectKey = dir.path; parent.isPinned = true
-    let shared = BoardTask(title: "shared-owner")
-    var first = BoardTask(title: "first"); first.qoderSessionID = "first"; first.projectKey = dir.path
-    first.parentID = parent.id; first.boundParentIDs = [shared.id]; first.lastActivityAt = now.addingTimeInterval(-8 * 86400)
-    var second = first; second.id = UUID(); second.qoderSessionID = "second"; second.title = "second"
-    model.tasks = [parent, shared, first, second]
-    model.restoreHiddenItem(first.id, now: now); model.restoreHiddenItem(second.id, now: now)
-    let before = model.tasks
-    var confirmations = 0
-    precondition(!model.setSessionRetained(first.id, to: false, now: now) { confirmations += 1; return false })
-    precondition(confirmations == 1 && model.tasks == before)
-    precondition(model.setSessionRetained(first.id, to: false, now: now) { confirmations += 1; return true })
-    precondition(confirmations == 2)
-    for original in before {
-        var expected = original
-        if expected.id == first.id { expected.isPinned = false }
-        precondition(model.tasks.first { $0.id == expected.id } == expected)
-    }
-    precondition(model.hiddenItems(now: now).contains { $0.id == first.id })
-    precondition(!model.visibleChildren(of: parent.id, now: now).contains { $0.id == first.id })
-    precondition(!model.visibleChildren(of: shared.id, now: now).contains { $0.id == first.id })
-    precondition(model.visibleChildren(of: parent.id, now: now).contains { $0.id == second.id })
-    model.restoreHiddenItem(first.id, now: now)
-    precondition(model.visibleChildren(of: shared.id, now: now).contains { $0.id == first.id })
-    // Removing both old pins hides the expired auto-parent without altering its own star.
-    precondition(model.setSessionRetained(first.id, to: false, now: now) { true })
-    precondition(model.setSessionRetained(second.id, to: false, now: now) { true })
-    let currentParent = model.tasks.first { $0.id == parent.id }!
-    precondition(currentParent.isPinned && !model.isVisible(currentParent, now: now))
-    precondition(model.isVisible(currentParent, now: first.lastActivityAt.addingTimeInterval(7 * 86400 - 1)))
-    precondition(!model.isVisible(currentParent, now: first.lastActivityAt.addingTimeInterval(7 * 86400)))
-    // Exactly 24 hours is hidden; just before it, cancellation is immediate and needs no prompt.
-    model.restoreHiddenItem(first.id, now: now)
-    precondition(model.setSessionRetained(first.id, to: false, now: first.lastActivityAt.addingTimeInterval(86400 - 1)) {
-        preconditionFailure("recent cancellation should not prompt")
-    })
-    precondition(model.setSessionRetained(first.id, to: true, now: now) { preconditionFailure("retaining should not prompt") })
-    precondition(!model.setSessionRetained(first.id, to: false, now: first.lastActivityAt.addingTimeInterval(86400)) { false })
-    precondition(!model.setSessionRetained(parent.id, to: false, now: now) { preconditionFailure("owner should not prompt") })
-    precondition(!model.setSessionRetained(UUID(), to: true, now: now) { preconditionFailure("missing should not prompt") })
-    let reloaded = BoardModel(dataDirectory: dir, sources: .synthetic(dir))
-    precondition(reloaded.tasks == model.tasks)
-    fail = true
-    precondition(model.setSessionRetained(first.id, to: false, now: now) { true })
-    precondition(model.persistenceError != nil && model.storageExitSummary.hasUncommittedEdits)
-    precondition(!model.tasks.first { $0.id == first.id }!.isPinned)
-    precondition(BoardTerminationCoordinator(model: model).requestTermination(prompt: { _ in .cancel }, restoreWindow: {}) == .terminateCancel)
-    fail = false; model.retrySave()
-    precondition(!model.storageExitSummary.requiresConfirmation)
-    let restored = BoardModel(dataDirectory: dir, sources: .synthetic(dir))
-    precondition(restored.tasks == model.tasks)
-    print("Session retention self-test passed (shared identity, independent pins, cancel, boundaries, persistence)")
-}
-
 if CommandLine.arguments.contains("--termination-protection-self-test") {
     try runTerminationProtectionSelfTest()
-} else if CommandLine.arguments.contains("--session-retention-self-test") {
-    try runSessionRetentionSelfTest()
 } else if CommandLine.arguments.contains("--storage-writer-self-test") {
     try runStorageWriterFixture()
 } else if CommandLine.arguments.contains("--storage-transaction-self-test") {
     try runStorageTransactionSelfTest()
 } else if CommandLine.arguments.contains("--display-clock-self-test") {
     try runDisplayClockSelfTest()
-} else if CommandLine.arguments.contains("--recovery-ui-self-test") {
-    let labels = RecoveryProjectLabels(paths: ["/synthetic/prod/project", "/synthetic/trial/project", "/a/x", "/b/a/x", nil, "/", "/tail/"])
-    precondition(labels.label(for: "/synthetic/prod/project") == "prod/project")
-    precondition(labels.label(for: "/synthetic/trial/project") == "trial/project")
-    precondition(labels.label(for: "/a/x") != labels.label(for: "/b/a/x"))
-    precondition(labels.label(for: nil) == "项目未提供" && labels.label(for: "/") == "/")
-    precondition(labels.label(for: "/tail/") == labels.label(for: "/tail"))
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-recovery-ui-" + UUID().uuidString)
-    defer { try? FileManager.default.removeItem(at: directory) }
-    let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
-    let now = Date(timeIntervalSince1970: 2_000_000_000)
-    var recentParent = BoardTask(title: "recent"); recentParent.isAutoGroup = true; recentParent.projectKey = directory.appendingPathComponent("recent").path
-    var oldParent = BoardTask(title: "old"); oldParent.isAutoGroup = true; oldParent.projectKey = directory.appendingPathComponent("old").path
-    var human = BoardTask(title: "完整的很长很长会话名称，具有相似前缀A")
-    human.qoderSessionID = "hidden-human"; human.projectKey = recentParent.projectKey; human.parentID = recentParent.id
-    human.state = .human; human.lastActivityAt = now.addingTimeInterval(-25 * 3600)
-    var older = BoardTask(title: "完整的很长很长会话名称，具有相似前缀B")
-    older.codexThreadID = "hidden-old"; older.projectKey = oldParent.projectKey; older.parentID = oldParent.id
-    older.state = .ready; older.lastActivityAt = now.addingTimeInterval(-8 * 86400)
-    var other = BoardTask(title: "另一条隐藏会话")
-    other.qoderSessionID = "hidden-other"; other.projectKey = oldParent.projectKey; other.parentID = oldParent.id
-    other.state = .waiting; other.lastActivityAt = older.lastActivityAt
-    model.tasks = [recentParent, oldParent, human, older, other]
-    precondition(model.isVisible(human, now: human.lastActivityAt.addingTimeInterval(24 * 3600 - 1)))
-    precondition(!model.isVisible(human, now: human.lastActivityAt.addingTimeInterval(24 * 3600 + 1)))
-    precondition(model.isVisible(oldParent, now: older.lastActivityAt.addingTimeInterval(7 * 86400 - 1)))
-    precondition(!model.isVisible(oldParent, now: older.lastActivityAt.addingTimeInterval(7 * 86400 + 1)))
-    let hidden = Set(model.hiddenItems(now: now).map(\.id))
-    precondition(hidden.contains(human.id) && hidden.contains(oldParent.id))
-    precondition(model.hiddenReason(for: human).contains("24小时"))
-    precondition(model.hiddenReason(for: oldParent).contains("7天"))
-    model.restoreHiddenItem(oldParent.id, now: now)
-    for original in [older, other] {
-        let restored = model.tasks.first { $0.id == original.id }!
-        precondition(restored.isPinned && restored.state == original.state && restored.parentID == original.parentID && restored.boundParentIDs == original.boundParentIDs)
-    }
-    precondition(model.isVisible(model.tasks.first { $0.id == oldParent.id }!, now: now))
-    let reloaded = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
-    for _ in 0..<2 {
-        let ticket = reloaded.beginPoll()!
-        precondition(reloaded.commitPollSnapshot(BoardPollSnapshot(), ticket: ticket))
-    }
-    precondition(reloaded.tasks.first { $0.id == older.id }!.isPinned && reloaded.tasks.first { $0.id == other.id }!.isPinned)
-    precondition(reloaded.tasks.first { $0.id == human.id }!.state == .human)
-    print("Recovery/details synthetic model self-test passed (ordinary UI untested)")
 } else if CommandLine.arguments.contains("--poll-snapshot-self-test") {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-poll-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: directory) }
@@ -3692,7 +3496,7 @@ if CommandLine.arguments.contains("--termination-protection-self-test") {
     precondition(CodexReader.sessions(databaseURL: missing).isEmpty)
     precondition(CodexReader.databaseDiagnostic(at: missing) == .readFailure)
     print("Codex format and diagnostics self-test passed")
-} else if CommandLine.arguments.contains("--pinned-navigation-self-test") {
+} else if CommandLine.arguments.contains("--latest-navigation-self-test") {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-navigation-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: directory) }
     let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
@@ -3708,8 +3512,9 @@ if CommandLine.arguments.contains("--termination-protection-self-test") {
     precondition(model.navigationTarget(for: parent, now: now)?.id == newest.id)
     model.update(older.id) { $0.isPinned = true }
     model.update(oldest.id) { $0.isPinned = true }
-    precondition(model.navigationTarget(for: parent, now: now)?.id == older.id)
-    model.update(oldest.id) { $0.lastActivityAt = older.lastActivityAt }
+    precondition(model.navigationTarget(for: parent, now: now)?.id == newest.id)
+    model.update(older.id) { $0.lastActivityAt = now.addingTimeInterval(1) }
+    model.update(oldest.id) { $0.lastActivityAt = now.addingTimeInterval(1) }
     let stable = [older.id, oldest.id].sorted { $0.uuidString < $1.uuidString }.first!
     precondition(model.navigationTarget(for: parent, now: now)?.id == stable)
     let selected = model.navigationTarget(for: parent, now: now)!
@@ -3728,7 +3533,7 @@ if CommandLine.arguments.contains("--termination-protection-self-test") {
     precondition(model.navigationTarget(for: parent, now: now) == nil)
     model.openConversation(for: parent, now: now, opener: { opened.append($0.id); return true })
     precondition(opened.isEmpty)
-    print("Pinned navigation self-test passed")
+    print("Latest navigation self-test passed")
 } else if CommandLine.arguments.contains("--completion-override-self-test") {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-completion-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: directory) }
@@ -3875,7 +3680,7 @@ if CommandLine.arguments.contains("--termination-protection-self-test") {
     precondition(candidate.codexThreadID == threadID)
     model.bindSession(candidate.id, to: first.id)
     let bound = model.tasks.first { $0.codexThreadID == threadID }!
-    precondition(bound.isPinned && model.visibleChildren(of: first.id).contains { $0.id == bound.id })
+    precondition(!bound.isPinned && !model.visibleChildren(of: first.id).contains { $0.id == bound.id })
     let deadline = Date().addingTimeInterval(2)
     while model.tasks.first(where: { $0.id == bound.id })?.state != .human && Date() < deadline {
         RunLoop.main.run(until: Date().addingTimeInterval(0.02))
@@ -3883,8 +3688,10 @@ if CommandLine.arguments.contains("--termination-protection-self-test") {
     precondition(model.tasks.first(where: { $0.id == bound.id })?.state == .human)
     model.bindSession(bound.id, to: second.id)
     let restored = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
-    precondition(restored.visibleChildren(of: first.id).contains { $0.codexThreadID == threadID })
-    precondition(restored.visibleChildren(of: second.id).contains { $0.codexThreadID == threadID })
+    precondition(restored.children(of: first.id).contains { $0.codexThreadID == threadID })
+    precondition(!restored.visibleChildren(of: first.id).contains { $0.codexThreadID == threadID })
+    precondition(restored.children(of: second.id).contains { $0.codexThreadID == threadID })
+    precondition(!restored.visibleChildren(of: second.id).contains { $0.codexThreadID == threadID })
     print("Codex recent self-test passed")
 } else if CommandLine.arguments.contains("--auto-group-repair-self-test") {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-group-repair-\(UUID().uuidString)")
@@ -4173,11 +3980,9 @@ if CommandLine.arguments.contains("--termination-protection-self-test") {
     model.setState(recentID, to: .done)
     precondition(model.visibleChildren(of: parent.id, now: now).count == 1)
     precondition(model.visibleChildren(of: parent.id, now: now.addingTimeInterval(23 * 3600)).isEmpty)
-    model.setPinned(oldID)
+    model.update(oldID) { $0.isPinned = true }
     precondition(model.visibleChildren(of: parent.id, now: now).first?.id == recentID)
-    precondition(model.navigationTarget(for: parent, now: now)?.id == oldID)
-    precondition(model.isVisible(parent, now: now.addingTimeInterval(8 * 86400)))
-    model.setPinned(oldID)
+    precondition(model.navigationTarget(for: parent, now: now)?.id == recentID)
     precondition(!model.isVisible(parent, now: now.addingTimeInterval(8 * 86400)))
     model.update(oldID) { $0.lastActivityAt = now.addingTimeInterval(8 * 86400) }
     precondition(model.isVisible(parent, now: now.addingTimeInterval(8 * 86400)))

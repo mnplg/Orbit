@@ -27,7 +27,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict></plist>
 PLIST
 
-swiftc "${orbit_swift_args[@]}" -framework AppKit -framework SwiftUI "$ROOT/Sources/main.swift" "$ROOT/Sources/QoderDesktopNavigator.swift" "$ROOT/Sources/RecoveryViews.swift" -o "$APP/Contents/MacOS/DeskFocusBoard"
+swiftc "${orbit_swift_args[@]}" -framework AppKit -framework SwiftUI "$ROOT/Sources/main.swift" "$ROOT/Sources/QoderDesktopNavigator.swift" -o "$APP/Contents/MacOS/DeskFocusBoard"
 swiftc "${orbit_swift_args[@]}" -O "$ROOT/Sources/qoder-hook.swift" -o "$APP/Contents/MacOS/QoderHook"
 cp "$ROOT/Assets/starlight-mascot.png" "$APP/Contents/Resources/starlight-mascot.png"
 cp "$ROOT/Assets/starlight-clouds.png" "$APP/Contents/Resources/starlight-clouds.png"
