@@ -477,6 +477,38 @@ enum CodexReader {
     static let databaseURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".codex/state_5.sqlite")
 
+    static func isInternalSource(_ source: String) -> Bool {
+        if source.lowercased() == "subagent" { return true }
+        guard let data = source.data(using: .utf8),
+              let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        return value["subagent"] != nil
+    }
+
+    /// Read metadata only, including archived/old agents already imported by earlier Orbit versions.
+    static func internalThreadIDs(databaseURL: URL) -> Set<String>? {
+        SyntheticAccess.check(databaseURL)
+        var database: OpaquePointer?
+        guard sqlite3_open_v2(databaseURL.path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
+              let database else {
+            if database != nil { sqlite3_close(database) }
+            return nil
+        }
+        defer { sqlite3_close(database) }
+        sqlite3_busy_timeout(database, 100)
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, "SELECT id, source FROM threads", -1, &statement, nil) == SQLITE_OK,
+              let statement else { return nil }
+        defer { sqlite3_finalize(statement) }
+        var result: Set<String> = []
+        var step = sqlite3_step(statement)
+        while step == SQLITE_ROW {
+            if let id = sqlite3_column_text(statement, 0), let source = sqlite3_column_text(statement, 1),
+               isInternalSource(String(cString: source)) { result.insert(String(cString: id)) }
+            step = sqlite3_step(statement)
+        }
+        return step == SQLITE_DONE ? result : nil
+    }
+
     static func recentThreads(databaseURL: URL = databaseURL) -> [CodexRecentThread] {
         SyntheticAccess.check(databaseURL)
         databaseResult(databaseURL, .readFailure)
@@ -488,6 +520,7 @@ enum CodexReader {
         }
         defer { sqlite3_close(database) }
         sqlite3_busy_timeout(database, 100)
+        let internalIDs = internalThreadIDs(databaseURL: databaseURL) ?? []
         let sql = """
             SELECT id, COALESCE(NULLIF(name, ''), title), cwd, rollout_path,
                    COALESCE(NULLIF(recency_at, 0), updated_at)
@@ -505,6 +538,7 @@ enum CodexReader {
             guard let rawID = sqlite3_column_text(statement, 0),
                   let rawTitle = sqlite3_column_text(statement, 1) else { continue }
             let id = String(cString: rawID)
+            guard !internalIDs.contains(id) else { continue }
             let title = String(cString: rawTitle).trimmingCharacters(in: .whitespacesAndNewlines)
             guard UUID(uuidString: id) != nil, !title.isEmpty else { continue }
             let cwd = sqlite3_column_text(statement, 2).map { String(cString: $0) } ?? ""
@@ -566,11 +600,12 @@ enum CodexReader {
         }
         defer { sqlite3_close(database) }
         sqlite3_busy_timeout(database, 100)
+        let internalIDs = internalThreadIDs(databaseURL: databaseURL) ?? []
         let sql = """
             SELECT id, COALESCE(NULLIF(name, ''), title), cwd, rollout_path, updated_at
             FROM threads
             WHERE archived = 0 AND updated_at >= ?
-            ORDER BY updated_at DESC LIMIT 200
+            ORDER BY updated_at DESC
             """
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK,
@@ -585,6 +620,7 @@ enum CodexReader {
                   let rawTitle = sqlite3_column_text(statement, 1),
                   let rawRollout = sqlite3_column_text(statement, 3) else { continue }
             let id = String(cString: rawID)
+            guard !internalIDs.contains(id) else { continue }
             let title = String(cString: rawTitle).trimmingCharacters(in: .whitespacesAndNewlines)
             let rolloutPath = String(cString: rawRollout)
             guard !id.isEmpty, !title.isEmpty else { continue }
@@ -598,6 +634,7 @@ enum CodexReader {
             let attrs = try? FileManager.default.attributesOfItem(atPath: rolloutPath)
             let fileModified = attrs?[.modificationDate] as? Date ?? .distantPast
             let modified = min(max(databaseModified, fileModified), now)
+            if found.count >= 200 { continue }
             let activity = latestActivity(at: rolloutPath)
             found.append(CodexSession(id: id, title: String(title.prefix(90)),
                                       lastUserPreview: activity.lastUserPreview,
@@ -792,6 +829,7 @@ struct BoardPollSnapshot {
     var qoder: [QoderSession] = []
     var hookEvents: [[String: Any]] = []
     var codex: [CodexSession] = []
+    var internalCodexIDs: Set<String>? = nil
 }
 
 struct BoardPollTicket {
@@ -870,6 +908,7 @@ final class BoardModel: ObservableObject {
     private let fileURL: URL
     private let qoderEventsURL: URL
     private let sources: BoardSources
+    private var internalCodexIDs: Set<String> = []
     private var loading = true
     private var revision: UInt64 = 0
     private var persistedTasks: [BoardTask]?
@@ -1156,7 +1195,8 @@ final class BoardModel: ObservableObject {
         return BoardPollSnapshot(cursor: cursor, cursorObservations: observations,
                                  qoder: QoderReader.sessions(root: request.qoderRoot),
                                  hookEvents: CursorReader.lines(at: request.hookURL.path),
-                                 codex: CodexReader.sessions(databaseURL: request.codexDatabase))
+                                 codex: CodexReader.sessions(databaseURL: request.codexDatabase),
+                                 internalCodexIDs: CodexReader.internalThreadIDs(databaseURL: request.codexDatabase))
     }
 
     func beginPoll() -> BoardPollTicket? {
@@ -1182,6 +1222,7 @@ final class BoardModel: ObservableObject {
         let started = Date()
         let savesBefore = savedSnapshotCount
         performBatch {
+            if let ids = snapshot.internalCodexIDs { internalCodexIDs.formUnion(ids) }
             mergeCursor(snapshot.cursor, observations: snapshot.cursorObservations)
             mergeQoderEvents(snapshot.hookEvents, defaults: sources.defaults)
             mergeQoderTranscripts(snapshot.qoder)
@@ -1336,7 +1377,7 @@ final class BoardModel: ObservableObject {
             candidate.state = .ready
             return candidate
         }
-        return (tasks.filter { $0.isConversation && !$0.belongs(to: parentID) } + recentCandidates)
+        return (tasks.filter { $0.isConversation && !isInternalConversation($0) && !$0.belongs(to: parentID) } + recentCandidates)
             .sorted {
                 if $0.lastActivityAt != $1.lastActivityAt { return $0.lastActivityAt > $1.lastActivityAt }
                 return $0.id.uuidString < $1.id.uuidString
@@ -1451,6 +1492,10 @@ final class BoardModel: ObservableObject {
         }
     }
 
+    private func isInternalConversation(_ task: BoardTask) -> Bool {
+        task.codexThreadID.map { internalCodexIDs.contains($0) } ?? false
+    }
+
     func children(of id: UUID) -> [BoardTask] {
         tasks.filter { $0.belongs(to: id) }.sorted(by: sessionOrder)
     }
@@ -1461,7 +1506,7 @@ final class BoardModel: ObservableObject {
     }
 
     func visibleChildren(of id: UUID, now: Date = Date()) -> [BoardTask] {
-        children(of: id).filter { now.timeIntervalSince($0.lastActivityAt) < 24 * 3600 }
+        children(of: id).filter { !isInternalConversation($0) && now.timeIntervalSince($0.lastActivityAt) < 24 * 3600 }
     }
 
     func latestActivityDate(for task: BoardTask, now: Date = Date()) -> Date {
@@ -1492,7 +1537,7 @@ final class BoardModel: ObservableObject {
 
     /// Recheck the selected identity and ownership without substituting another session.
     func validatedNavigationTarget(_ selected: BoardTask, for owner: BoardTask, now: Date = Date()) -> BoardTask? {
-        guard let current = tasks.first(where: { $0.id == selected.id }), hasNavigationSource(current),
+        guard let current = tasks.first(where: { $0.id == selected.id }), !isInternalConversation(current), hasNavigationSource(current),
               current.cursorPath == selected.cursorPath, current.qoderSessionID == selected.qoderSessionID,
               current.codexThreadID == selected.codexThreadID,
               let currentOwner = tasks.first(where: { $0.id == owner.id }) else { return nil }
@@ -1538,9 +1583,12 @@ final class BoardModel: ObservableObject {
     }
 
     func isVisible(_ task: BoardTask, now: Date = Date()) -> Bool {
+        if isInternalConversation(task) { return false }
         if task.isConversation { return now.timeIntervalSince(task.lastActivityAt) < 24 * 3600 }
         guard task.isAutoGroup else { return true }
-        let sessions = children(of: task.id)
+        let allSessions = children(of: task.id)
+        let sessions = allSessions.filter { !isInternalConversation($0) }
+        if !allSessions.isEmpty && sessions.isEmpty { return false }
         guard let latest = sessions.map(\.lastActivityAt).max() else { return true }
         return now.timeIntervalSince(latest) < 7 * 24 * 3600
     }
@@ -1555,6 +1603,11 @@ final class BoardModel: ObservableObject {
         if children.contains(where: { $0.state == .working }) { return .working }
         if children.contains(where: { $0.state == .waiting }) { return .waiting }
         return task.state
+    }
+
+    func hasNoActiveConversations(_ task: BoardTask, now: Date = Date()) -> Bool {
+        !task.isConversation && !task.completionOverride && task.state != .done &&
+            (task.isAutoGroup || !children(of: task.id).isEmpty) && visibleChildren(of: task.id, now: now).isEmpty
     }
 
     func summarySessionCount(for task: BoardTask, now: Date = Date()) -> Int {
@@ -1729,7 +1782,7 @@ final class BoardModel: ObservableObject {
 
     func mergeCodex(_ sessions: [CodexSession]) {
         precondition(Thread.isMainThread, "Codex model merges must run on the main thread")
-        for session in sessions {
+        for session in sessions where !internalCodexIDs.contains(session.id) {
             if let index = tasks.firstIndex(where: { $0.codexThreadID == session.id }) {
                 let childID = tasks[index].id
                 if tasks[index].projectKey != session.projectKey {
@@ -2028,8 +2081,8 @@ struct BoardView: View {
             }
             .buttonStyle(.plain)
             .help(showStarredOnly ? "显示全部事项" : "只看星标")
-            let actionCount = model.active(now: now).filter { [.human, .ready].contains(model.displayState(for: $0, now: now)) }.count
-            let hasHumanAction = model.active(now: now).contains { model.displayState(for: $0, now: now) == .human }
+            let actionCount = model.active(now: now).filter { !model.hasNoActiveConversations($0, now: now) && [.human, .ready].contains(model.displayState(for: $0, now: now)) }.count
+            let hasHumanAction = model.active(now: now).contains { !model.hasNoActiveConversations($0, now: now) && model.displayState(for: $0, now: now) == .human }
             if actionCount > 0 {
                 Text("\(actionCount) 件待处理")
                     .font(.system(size: 10, weight: .bold))
@@ -2128,7 +2181,8 @@ struct TaskCard: View {
     @State private var menuOpen = false
 
     private var displayState: TaskState { model.displayState(for: task, now: now) }
-    private var stateColor: Color { theme.stateTint(displayState) }
+    private var noActiveConversations: Bool { model.hasNoActiveConversations(task, now: now) }
+    private var stateColor: Color { noActiveConversations ? theme.secondaryText : theme.stateTint(displayState) }
     private var childSessions: [BoardTask] { model.visibleChildren(of: task.id, now: now) }
     private var displaySince: Date {
         childSessions.first?.lastActivityAt ?? task.lastActivityAt
@@ -2154,7 +2208,7 @@ struct TaskCard: View {
         return previewSession.sourceName
     }
     private var summary: String {
-        "\(displayState.rawValue) · \(compactElapsed) · \(stateSessionCount)会话"
+        noActiveConversations ? "暂无活跃会话" : "\(displayState.rawValue) · \(compactElapsed) · \(stateSessionCount)会话"
     }
     private var stateSessionCount: Int {
         model.summarySessionCount(for: task, now: now)
@@ -2169,7 +2223,7 @@ struct TaskCard: View {
                     ZStack {
                         RoundedRectangle(cornerRadius: 7)
                             .fill(theme.iconBackground.opacity(0.8))
-                        Image(systemName: displayState.symbol)
+                        Image(systemName: noActiveConversations ? "minus.circle" : displayState.symbol)
                             .font(.system(size: 10, weight: .bold))
                             .foregroundStyle(theme.primaryText)
                     }
@@ -3139,6 +3193,7 @@ func runDisplayClockSelfTest() throws {
         precondition(model.visibleChildren(of: owner.id, now: now).isEmpty)
         precondition(model.displayState(for: owner, now: now) == .waiting)
         precondition(model.summarySessionCount(for: owner, now: now) == 0)
+        precondition(model.hasNoActiveConversations(owner, now: now))
     }
     model.update(human.id) { $0.isPinned = true }
     let future = activity.addingTimeInterval(8 * 86400)
@@ -3148,6 +3203,8 @@ func runDisplayClockSelfTest() throws {
     // An older UI tick is intentionally independent of actual wall time.
     let priorTick = activity.addingTimeInterval(86399)
     precondition(model.displayState(for: owner, now: priorTick) == .human)
+    precondition(!model.hasNoActiveConversations(owner, now: priorTick))
+    precondition(!model.hasNoActiveConversations(plain, now: future))
     precondition(model.displayState(for: plain, now: future) == .ready)
     print("Display clock self-test passed (24h/7d boundaries, mixed states, pinned, ordinary tasks)")
 }
@@ -3329,7 +3386,49 @@ func runTerminationProtectionSelfTest() throws {
     print("Termination protection self-test passed (production coordinator; native dialogs untested)")
 }
 
-if CommandLine.arguments.contains("--termination-protection-self-test") {
+if CommandLine.arguments.contains("--codex-internal-self-test") {
+    let root = URL(fileURLWithPath: ProcessInfo.processInfo.environment["ORBIT_SYNTHETIC_ROOT"]!)
+        .appendingPathComponent("internal-" + UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let dbURL = root.appendingPathComponent("threads.sqlite")
+    let rollout = root.appendingPathComponent("normal.jsonl")
+    try "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n".write(to: rollout, atomically: true, encoding: .utf8)
+    var db: OpaquePointer?
+    precondition(sqlite3_open(dbURL.path, &db) == SQLITE_OK)
+    let normalID = UUID().uuidString, agentID = UUID().uuidString, guardianID = UUID().uuidString
+    let now = Date(), timestamp = Int(now.timeIntervalSince1970)
+    let sql = """
+    CREATE TABLE threads (id TEXT, name TEXT, title TEXT, cwd TEXT, rollout_path TEXT, updated_at INTEGER, recency_at INTEGER, archived INTEGER, source TEXT);
+    INSERT INTO threads VALUES ('\(normalID)', '', 'Guardian review', '\(root.path)', '\(rollout.path)', \(timestamp), \(timestamp), 0, 'vscode');
+    INSERT INTO threads VALUES ('\(agentID)', '', 'ordinary title', '\(root.path)', '/must-not-read-agent', \(timestamp), \(timestamp), 0, '{"subagent":{"thread_spawn":{"depth":1}}}');
+    INSERT INTO threads VALUES ('\(guardianID)', '', 'review', '\(root.path)', '/must-not-read-guardian', 1, 1, 1, '{"subagent":{"other":"guardian"}}');
+    """
+    precondition(sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK)
+    sqlite3_close(db)
+    let excluded = CodexReader.internalThreadIDs(databaseURL: dbURL)!
+    precondition(excluded == Set([agentID, guardianID]))
+    precondition(CodexReader.sessions(databaseURL: dbURL).map(\.id) == [normalID])
+    precondition(CodexReader.recentThreads(databaseURL: dbURL).map(\.id) == [normalID])
+    let model = BoardModel(dataDirectory: root.appendingPathComponent("board"), sources: .synthetic(root))
+    for id in [normalID, agentID, guardianID] {
+        model.mergeCodex([CodexSession(id: id, title: "fixture", lastUserPreview: "", state: .ready,
+            modified: now, projectKey: root.path, projectTitle: "fixture")])
+    }
+    let owner = model.tasks.first { $0.isAutoGroup }!
+    let agent = model.tasks.first { $0.codexThreadID == agentID }!
+    precondition(model.visibleChildren(of: owner.id, now: now).count == 3)
+    precondition(model.commitPollSnapshot(BoardPollSnapshot(internalCodexIDs: excluded), ticket: model.beginPoll()!))
+    precondition(model.visibleChildren(of: owner.id, now: now).map(\.codexThreadID) == [normalID])
+    precondition(!model.isVisible(agent, now: now) && model.navigationTarget(for: agent, now: now) == nil)
+    precondition(!model.bindableSessions(for: UUID()).contains { $0.codexThreadID == agentID })
+    precondition(model.tasks.contains { $0.id == agent.id }) // Hide without deleting stored records.
+    model.remove(model.tasks.first { $0.codexThreadID == normalID }!.id)
+    precondition(!model.isVisible(owner, now: now)) // Agent-only auto groups disappear as well.
+    precondition(!CodexReader.isInternalSource("vscode"))
+    precondition(!CodexReader.isInternalSource("unknown-future-source"))
+    print("Codex internal-session filtering self-test passed")
+} else if CommandLine.arguments.contains("--termination-protection-self-test") {
     try runTerminationProtectionSelfTest()
 } else if CommandLine.arguments.contains("--storage-writer-self-test") {
     try runStorageWriterFixture()
