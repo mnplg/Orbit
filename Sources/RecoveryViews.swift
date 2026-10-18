@@ -1,5 +1,45 @@
 import SwiftUI
 
+/// Resolves against the complete hidden set so searching does not rename projects.
+/// Identical full paths share a label: this identifies projects, not sessions.
+struct RecoveryProjectLabels {
+    private let labels: [String: String]
+
+    init(paths: [String?]) {
+        let paths = Set(paths.compactMap(Self.path))
+        let components = Dictionary(uniqueKeysWithValues: paths.map { ($0, $0.split(separator: "/").map(String.init)) })
+        var resolved: [String: String] = [:]
+        for path in paths {
+            let parts = components[path] ?? []
+            var label = path
+            for depth in 1...max(1, parts.count) {
+                let suffix = Array(parts.suffix(depth))
+                let ambiguous = paths.contains { other in
+                    other != path && Array((components[other] ?? []).suffix(depth)) == suffix
+                }
+                if !ambiguous && !suffix.isEmpty {
+                    label = suffix.joined(separator: "/")
+                    break
+                }
+            }
+            resolved[path] = label
+        }
+        labels = resolved
+    }
+
+    func label(for path: String?) -> String {
+        guard let path = Self.path(path) else { return "项目未提供" }
+        return labels[path] ?? path
+    }
+
+    private static func path(_ value: String?) -> String? {
+        guard var value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
+        // Pure string normalization only; never inspect the user's filesystem.
+        while value.count > 1 && value.hasSuffix("/") { value.removeLast() }
+        return value
+    }
+}
+
 extension BoardModel {
     /// Includes hidden children even when their parent itself is hidden.
     func hiddenItems(now: Date = Date()) -> [BoardTask] {
@@ -37,13 +77,18 @@ struct HiddenRecoverySheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var search = ""
     @State private var details: BoardTask?
+    private var hiddenItems: [BoardTask] { model.hiddenItems(now: now) }
+    private var projectLabels: RecoveryProjectLabels {
+        RecoveryProjectLabels(paths: hiddenItems.map(\.projectKey))
+    }
     private var matches: [BoardTask] {
-        model.hiddenItems(now: now).filter { task in
+        hiddenItems.filter { task in
             search.isEmpty || [task.title, task.sourceName, task.projectKey ?? ""]
                 .contains { $0.localizedCaseInsensitiveContains(search) }
         }
     }
     var body: some View {
+        let labels = projectLabels
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text("找回已隐藏事项").font(.headline)
@@ -60,6 +105,11 @@ struct HiddenRecoverySheet: View {
                         VStack(alignment: .leading, spacing: 5) {
                             Text(task.title).font(.body.weight(.semibold)).textSelection(.enabled)
                             Text(task.isConversation ? task.sourceName : "自动主体")
+                            Text("项目：\(labels.label(for: task.projectKey))")
+                                .font(.callout).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .textSelection(.enabled)
+                                .help(task.projectKey ?? "项目未提供")
                             Text(model.hiddenReason(for: task)).foregroundStyle(.secondary)
                             Text("最后活动：\(task.isConversation ? task.lastActivityAt : (model.children(of: task.id).map(\.lastActivityAt).max() ?? task.lastActivityAt), formatter: Self.dateFormatter)")
                             HStack {
