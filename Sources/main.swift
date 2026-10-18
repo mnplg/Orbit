@@ -805,6 +805,43 @@ struct BoardPollMetrics {
     let savedSnapshots: Int
 }
 
+/// A stable inode coordinates every cooperating holder; the main JSON is atomically replaced.
+private final class BoardStorageLease {
+    private static let local = NSLock()
+    private let descriptor: Int32
+    init(directory: URL) throws {
+        guard Self.local.try() else { throw BoardStorageFailure.busy }
+        let fd = Darwin.open(directory.appendingPathComponent("tasks.lock").path, O_CREAT | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR)
+        guard fd >= 0 else {
+            Self.local.unlock()
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            let failure = errno
+            Darwin.close(fd)
+            Self.local.unlock()
+            if failure == EWOULDBLOCK { throw BoardStorageFailure.busy }
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(failure))
+        }
+        descriptor = fd
+    }
+    deinit {
+        flock(descriptor, LOCK_UN)
+        Darwin.close(descriptor)
+        Self.local.unlock()
+    }
+}
+
+private enum BoardStorageFailure: LocalizedError {
+    case conflict, busy
+    var errorDescription: String? {
+        switch self {
+        case .conflict: "保存冲突：任务文件已被其他持有者修改。当前修改仍在内存；重试不会覆盖其他版本，请保留当前窗口。"
+        case .busy: "任务存储正被其他持有者使用，当前修改仍在内存；请稍后重试。"
+        }
+    }
+}
+
 final class BoardModel: ObservableObject {
     @Published private var storedTasks: [BoardTask] = []
     private var batchTasks: [BoardTask]?
@@ -837,6 +874,11 @@ final class BoardModel: ObservableObject {
     private var revision: UInt64 = 0
     private var persistedTasks: [BoardTask]?
     private var knownValidMainData: Data?
+    // nil means the file did not exist; establishment is separate from that valid version.
+    private var expectedMainData: Data?
+    private var hasStorageBaseline = false
+    private var pendingBackupData: Data?
+    private var hasExternalConflict = false
     private var encodedTasks: [UUID: (task: BoardTask, data: Data)] = [:]
     private(set) var lastSaveMilliseconds = 0.0
     private(set) var lastSavePhaseMilliseconds: [String: Double] = [:]
@@ -863,11 +905,16 @@ final class BoardModel: ObservableObject {
         SyntheticAccess.check(support)
         fileURL = support.appendingPathComponent("tasks.json")
         qoderEventsURL = self.sources.hookURL ?? support.appendingPathComponent("qoder-events.jsonl")
+        var needsInitialSave = false
         do {
             try storageFault?("create")
             try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
-            let mainExists = FileManager.default.fileExists(atPath: fileURL.path)
-            let main = try? Data(contentsOf: fileURL)
+            let lease = try acquireStorageLease()
+            defer { withExtendedLifetime(lease) {} }
+            let main = try readMainData()
+            expectedMainData = main
+            hasStorageBaseline = true
+            let mainExists = main != nil
             let backup = try? Data(contentsOf: support.appendingPathComponent("tasks.json.bak"))
             let saved = main.flatMap { try? JSONDecoder().decode([BoardTask].self, from: $0) }
             let recovered = backup.flatMap { try? JSONDecoder().decode([BoardTask].self, from: $0) }
@@ -880,7 +927,7 @@ final class BoardModel: ObservableObject {
                 tasks = loaded
                 loadedSnapshot = true
                 let repaired = Self.normalizedAutoGroups(loaded)
-                if saved != nil, (try JSONEncoder().encode(loaded)) != (try JSONEncoder().encode(repaired)) {
+                if saved != nil, loaded != repaired {
                     let repairBackup = support.appendingPathComponent("tasks-before-auto-group-repair.json")
                     if !FileManager.default.fileExists(atPath: repairBackup.path) {
                         try storageFault?("repairBackup")
@@ -890,8 +937,8 @@ final class BoardModel: ObservableObject {
                 tasks = repaired
                 loading = false
                 // Repair/recovery only after the source snapshot is safely retained.
-                let changed = (try JSONEncoder().encode(loaded)) != (try JSONEncoder().encode(tasks))
-                if saved == nil || changed { save() }
+                let changed = loaded != tasks
+                needsInitialSave = saved == nil || changed
             } else if mainExists || FileManager.default.fileExists(atPath: support.appendingPathComponent("tasks.json.bak").path) {
                 loadBlocked = true
                 persistenceError = "任务文件无法读取，已保留隔离副本；请恢复有效备份后重试。"
@@ -901,7 +948,8 @@ final class BoardModel: ObservableObject {
             persistenceError = "无法加载任务：\(error.localizedDescription)"
         }
         loading = false
-        if persistenceError == nil { persistedTasks = tasks }
+        if needsInitialSave { save() }
+        else if persistenceError == nil { persistedTasks = tasks }
     }
 
     func retrySave() {
@@ -911,8 +959,12 @@ final class BoardModel: ObservableObject {
                 try storageFault?("create")
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 let backup = directory.appendingPathComponent("tasks.json.bak")
-                let exists = FileManager.default.fileExists(atPath: fileURL.path)
-                let main = try? Data(contentsOf: fileURL)
+                let lease = try acquireStorageLease()
+                defer { withExtendedLifetime(lease) {} }
+                let main = try readMainData()
+                if hasStorageBaseline { try validateStorageBaseline(main) }
+                else { expectedMainData = main; hasStorageBaseline = true }
+                let exists = main != nil
                 let saved = main.flatMap { try? JSONDecoder().decode([BoardTask].self, from: $0) }
                 let recovered = (try? Data(contentsOf: backup)).flatMap { try? JSONDecoder().decode([BoardTask].self, from: $0) }
                 if saved != nil { knownValidMainData = main }
@@ -922,7 +974,7 @@ final class BoardModel: ObservableObject {
                 }
                 if let loaded = saved ?? recovered {
                     let normalized = Self.normalizedAutoGroups(loaded)
-                    let changed = (try JSONEncoder().encode(loaded)) != (try JSONEncoder().encode(normalized))
+                    let changed = loaded != normalized
                     let repairBackup = directory.appendingPathComponent("tasks-before-auto-group-repair.json")
                     if saved != nil && changed && !FileManager.default.fileExists(atPath: repairBackup.path) {
                         try storageFault?("repairBackup")
@@ -933,6 +985,9 @@ final class BoardModel: ObservableObject {
                     if !loadedSnapshot {
                         tasks = Self.normalizedAutoGroups(local + loaded.filter { candidate in !local.contains { $0.id == candidate.id } })
                         loadedSnapshot = true
+                    } else {
+                        // Normalize current memory, retaining edits made while repair was blocked.
+                        tasks = Self.normalizedAutoGroups(local)
                     }
                     loading = false
                 } else if exists || FileManager.default.fileExists(atPath: backup.path) {
@@ -940,7 +995,7 @@ final class BoardModel: ObservableObject {
                 }
                 loadBlocked = false
             } catch {
-                persistenceError = "无法恢复任务：\(error.localizedDescription)"
+                recordStorageFailure(error, prefix: "无法恢复任务")
                 return
             }
         }
@@ -974,10 +1029,45 @@ final class BoardModel: ObservableObject {
         }
     }
 
+    private func acquireStorageLease() throws -> BoardStorageLease {
+        try storageFault?("lock")
+        return try BoardStorageLease(directory: fileURL.deletingLastPathComponent())
+    }
+
+    private func readMainData() throws -> Data? {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+        return try Data(contentsOf: fileURL)
+    }
+
+    private func validateStorageBaseline(_ actual: Data?) throws {
+        guard hasStorageBaseline, actual == expectedMainData, !hasExternalConflict else {
+            hasExternalConflict = true
+            throw BoardStorageFailure.conflict
+        }
+    }
+
+    private func recordStorageFailure(_ error: Error, prefix: String) {
+        if let failure = error as? BoardStorageFailure {
+            persistenceError = failure.localizedDescription
+        } else if pendingBackupData != nil {
+            let status = persistedTasks == tasks ? "任务已保存，备份未完成" : "当前修改尚未保存，且上次备份未完成"
+            persistenceError = "\(status)：\(error.localizedDescription)"
+        } else {
+            persistenceError = "\(prefix)：\(error.localizedDescription)"
+        }
+    }
+
+    private func finishPendingBackup(to backup: URL) throws {
+        guard let pendingBackupData else { return }
+        try storageFault?("backupRotate")
+        try rotateBackup(pendingBackupData, to: backup)
+        self.pendingBackupData = nil
+    }
+
     private func save() {
         guard !loading, !loadBlocked else { return }
         if batchDepth > 0 { pendingSave = true; return }
-        guard persistedTasks != tasks else { return }
+        guard persistedTasks != tasks || persistenceError != nil || pendingBackupData != nil else { return }
         let saveStarted = Date()
         var phaseStarted = saveStarted
         lastSavePhaseMilliseconds = [:]
@@ -987,36 +1077,41 @@ final class BoardModel: ObservableObject {
         defer { lastSaveMilliseconds = Date().timeIntervalSince(saveStarted) * 1000 }
         let backup = fileURL.deletingLastPathComponent().appendingPathComponent("tasks.json.bak")
         do {
+            let lease = try acquireStorageLease()
+            defer { withExtendedLifetime(lease) {} }
+            let previous = try readMainData()
+            try validateStorageBaseline(previous)
+            // Repair the original debt before accepting a further commit; never replace its source.
+            try finishPendingBackup(to: backup)
+            if persistedTasks == tasks {
+                persistenceError = nil
+                return
+            }
             let data = try encodedTaskSnapshot()
             phase("encode")
-            let previous = try? Data(contentsOf: fileURL)
             let validPrevious = previous != nil && (previous == knownValidMainData || previous.flatMap { try? JSONDecoder().decode([BoardTask].self, from: $0) } != nil)
             phase("read_validate_previous")
             try storageFault?("write")
-            // Stage the complete new snapshot before touching either existing copy.
             let staged = fileURL.deletingLastPathComponent().appendingPathComponent("tasks-stage-" + UUID().uuidString)
             defer { try? FileManager.default.removeItem(at: staged) }
             try data.write(to: staged)
             phase("stage")
             try storageFault?("replace")
-            // Both paths share a directory/filesystem; rename atomically replaces the main.
             guard Darwin.rename(staged.path, fileURL.path) == 0 else {
                 throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
             }
+            // Main commit is complete even if subsequent backup rotation fails.
+            expectedMainData = data
             knownValidMainData = data
-            phase("replace")
-            if validPrevious, let previous {
-                try storageFault?("backupRotate")
-                try rotateBackup(previous, to: backup)
-            } else if !FileManager.default.fileExists(atPath: backup.path) {
-                try storageFault?("backupRotate")
-                try rotateBackup(data, to: backup)
-            }
-            phase("backup")
             persistedTasks = tasks
             savedSnapshotCount += 1
+            phase("replace")
+            if validPrevious, let previous { pendingBackupData = previous }
+            else if !FileManager.default.fileExists(atPath: backup.path) { pendingBackupData = data }
+            try finishPendingBackup(to: backup)
+            phase("backup")
             persistenceError = nil
-        } catch { persistenceError = "任务尚未保存：\(error.localizedDescription)" }
+        } catch { recordStorageFailure(error, prefix: "任务尚未保存") }
     }
 
     func performBatch(_ operation: () -> Void) {
@@ -1458,9 +1553,9 @@ final class BoardModel: ObservableObject {
         return now.timeIntervalSince(latest) < 7 * 24 * 3600
     }
 
-    func displayState(for task: BoardTask) -> TaskState {
+    func displayState(for task: BoardTask, now: Date = Date()) -> TaskState {
         if !task.isConversation && task.completionOverride { return .done }
-        let children = visibleChildren(of: task.id).filter { $0.state != .done }
+        let children = visibleChildren(of: task.id, now: now).filter { $0.state != .done }
         if children.contains(where: { $0.state == .human }) { return .human }
         if task.state == .human { return .human }
         if children.contains(where: { $0.state == .ready }) { return .ready }
@@ -1471,7 +1566,7 @@ final class BoardModel: ObservableObject {
     }
 
     func summarySessionCount(for task: BoardTask, now: Date = Date()) -> Int {
-        let state = displayState(for: task)
+        let state = displayState(for: task, now: now)
         let sessions = task.isConversation ? [task] : visibleChildren(of: task.id, now: now)
         return sessions.filter { $0.state == state }.count
     }
@@ -1528,6 +1623,8 @@ final class BoardModel: ObservableObject {
     }
 
     private func mergeQoderEvents(_ events: [[String: Any]], defaults: UserDefaults) {
+        // No events cannot advance the cursor; avoid loading preferences for hook-free polls.
+        guard !events.isEmpty else { return }
         let savedCount = defaults.integer(forKey: "qoderEventLineCount")
         let oldCount = events.count < savedCount ? 0 : savedCount
         guard events.count > oldCount else { return }
@@ -1672,15 +1769,18 @@ final class BoardModel: ObservableObject {
         }
     }
 
-    var active: [BoardTask] {
-        tasks.filter { $0.parentID == nil && $0.boundParentIDs.isEmpty && isVisible($0) && displayState(for: $0) != .done }.sorted {
-            let firstActivity = latestActivityDate(for: $0)
-            let secondActivity = latestActivityDate(for: $1)
+    var active: [BoardTask] { active(now: Date()) }
+    var completed: [BoardTask] { completed(now: Date()) }
+
+    func active(now: Date) -> [BoardTask] {
+        tasks.filter { $0.parentID == nil && $0.boundParentIDs.isEmpty && isVisible($0, now: now) && displayState(for: $0, now: now) != .done }.sorted {
+            let firstActivity = latestActivityDate(for: $0, now: now)
+            let secondActivity = latestActivityDate(for: $1, now: now)
             if firstActivity != secondActivity { return firstActivity > secondActivity }
             return $0.createdAt > $1.createdAt
         }
     }
-    var completed: [BoardTask] { tasks.filter { $0.parentID == nil && $0.boundParentIDs.isEmpty && isVisible($0) && displayState(for: $0) == .done }.sorted { $0.stateSince > $1.stateSince } }
+    func completed(now: Date) -> [BoardTask] { tasks.filter { $0.parentID == nil && $0.boundParentIDs.isEmpty && isVisible($0, now: now) && displayState(for: $0, now: now) == .done }.sorted { $0.stateSince > $1.stateSince } }
 }
 
 struct StarlightBackdrop: View {
@@ -1817,10 +1917,10 @@ struct BoardView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
                     if showNewTaskField { newTaskRow }
-                    let activeTasks = filtered(model.active)
-                    let completedTasks = filtered(model.completed)
+                    let activeTasks = filtered(model.active(now: now))
+                    let completedTasks = filtered(model.completed(now: now))
                     if activeTasks.isEmpty {
-                        emptyState
+                        emptyState(hasCompletedStarred: showStarredOnly && !completedTasks.isEmpty)
                     } else {
                         HStack {
                             Text("当前事项").font(.system(size: 12, weight: .semibold)).foregroundStyle(theme.secondaryText)
@@ -1938,8 +2038,8 @@ struct BoardView: View {
             }
             .buttonStyle(.plain)
             .help(showStarredOnly ? "显示全部事项" : "只看星标")
-            let actionCount = model.active.filter { [.human, .ready].contains(model.displayState(for: $0)) }.count
-            let hasHumanAction = model.active.contains { model.displayState(for: $0) == .human }
+            let actionCount = model.active(now: now).filter { [.human, .ready].contains(model.displayState(for: $0, now: now)) }.count
+            let hasHumanAction = model.active(now: now).contains { model.displayState(for: $0, now: now) == .human }
             if actionCount > 0 {
                 Text("\(actionCount) 件待处理")
                     .font(.system(size: 10, weight: .bold))
@@ -1992,13 +2092,19 @@ struct BoardView: View {
         return tasks.filter(\.isPinned)
     }
 
-    private var emptyState: some View {
+    private func emptyState(hasCompletedStarred: Bool) -> some View {
         VStack(spacing: 9) {
             Image(systemName: "square.stack.3d.up.slash").font(.system(size: 32)).foregroundStyle(theme.secondaryText.opacity(0.6))
-            Text("从一件事开始").font(.system(size: 14, weight: .semibold))
-            Text("添加主体任务；同一项目的 AI 会话会自动归到一起。")
-                .font(.system(size: 11)).foregroundStyle(theme.secondaryText)
-                .multilineTextAlignment(.center)
+            Text(showStarredOnly ? (hasCompletedStarred ? "暂无未完成的星标事项" : "暂无星标事项") : "从一件事开始")
+                .font(.system(size: 14, weight: .semibold))
+            if showStarredOnly {
+                Button("显示全部事项") { showStarredOnly = false }
+                    .buttonStyle(.plain).foregroundStyle(theme.accent)
+            } else {
+                Text("添加主体任务；同一项目的 AI 会话会自动归到一起。")
+                    .font(.system(size: 11)).foregroundStyle(theme.secondaryText)
+                    .multilineTextAlignment(.center)
+            }
         }
         .frame(maxWidth: .infinity).padding(.vertical, 64)
     }
@@ -2006,7 +2112,7 @@ struct BoardView: View {
     private var footer: some View {
         HStack(spacing: 6) {
             Circle().fill(theme.stateTint(.working)).frame(width: 6, height: 6)
-            Text("任务 \(model.active.count)")
+            Text("任务 \(model.active(now: now).count)")
             Text("·")
             Circle().fill(theme.stateTint(.waiting)).frame(width: 6, height: 6)
             Text("等待会话 \(model.tasks.filter { $0.isConversation && $0.state == .waiting && model.isVisible($0, now: now) }.count)")
@@ -2035,7 +2141,7 @@ struct TaskCard: View {
     @State private var menuOpen = false
     @State private var detailTask: BoardTask?
 
-    private var displayState: TaskState { model.displayState(for: task) }
+    private var displayState: TaskState { model.displayState(for: task, now: now) }
     private var stateColor: Color { theme.stateTint(displayState) }
     private var childSessions: [BoardTask] { model.visibleChildren(of: task.id, now: now) }
     private var displaySince: Date {
@@ -2738,7 +2844,250 @@ func runPersistenceSelfTest() throws {
     print("Persistence recovery self-test passed")
 }
 
-if CommandLine.arguments.contains("--recovery-ui-self-test") {
+/// Child entry for the barrier test. Never enters the normal AppDelegate path.
+func runStorageWriterFixture() throws {
+    let args = CommandLine.arguments
+    guard let index = args.firstIndex(of: "--storage-writer-self-test"), args.count > index + 3 else { preconditionFailure("missing fixture arguments") }
+    let directory = URL(fileURLWithPath: args[index + 1])
+    let barrier = URL(fileURLWithPath: args[index + 2])
+    let name = args[index + 3]
+    SyntheticAccess.check(directory); SyntheticAccess.check(barrier)
+    let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
+    precondition(model.persistenceError == nil)
+    try Data().write(to: barrier.appendingPathComponent(name + ".ready"))
+    let deadline = Date().addingTimeInterval(15)
+    while !FileManager.default.fileExists(atPath: barrier.appendingPathComponent("go").path) {
+        precondition(Date() < deadline, "barrier timed out")
+        Thread.sleep(forTimeInterval: 0.01)
+    }
+    model.add(name)
+    let committed = model.persistenceError == nil
+    precondition(model.tasks.count == 1 && model.tasks[0].title == name)
+    if !committed {
+        model.retrySave()
+        precondition(model.persistenceError != nil, "retry must not adopt another writer's baseline")
+        precondition(model.tasks[0].title == name)
+    }
+    try JSONSerialization.data(withJSONObject: ["committed": committed, "title": name]).write(to: barrier.appendingPathComponent(name + ".result"))
+}
+
+func runStorageTransactionSelfTest() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-transactions-" + UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    func directory(_ name: String) throws -> URL {
+        let result = root.appendingPathComponent(name)
+        try FileManager.default.createDirectory(at: result, withIntermediateDirectories: true)
+        return result
+    }
+    func snapshot(_ directory: URL, _ name: String = "tasks.json") throws -> Data {
+        try Data(contentsOf: directory.appendingPathComponent(name))
+    }
+    for seeded in [false, true] {
+        let dir = try directory(seeded ? "existing" : "absent")
+        if seeded { BoardModel(dataDirectory: dir, sources: .synthetic(dir)).add("seed") }
+        let a = BoardModel(dataDirectory: dir, sources: .synthetic(dir))
+        let b = BoardModel(dataDirectory: dir, sources: .synthetic(dir))
+        a.add("A")
+        let main = try snapshot(dir), backup = try snapshot(dir, "tasks.json.bak")
+        b.add("B")
+        precondition(b.persistenceError?.contains("保存冲突") == true)
+        precondition(b.tasks.contains { $0.title == "B" })
+        b.retrySave()
+        precondition(b.persistenceError?.contains("保存冲突") == true)
+        precondition(try! snapshot(dir) == main && snapshot(dir, "tasks.json.bak") == backup)
+        a.add("A2")
+        precondition(a.persistenceError == nil)
+        let reloaded = BoardModel(dataDirectory: dir, sources: .synthetic(dir))
+        precondition(reloaded.tasks.contains { $0.title == "A2" })
+    }
+    // The lock is non-blocking, is not a renamed JSON inode, and covers same-process holders.
+    let busyDir = try directory("busy")
+    let busyModel = BoardModel(dataDirectory: busyDir, sources: .synthetic(busyDir))
+    do {
+        let lease = try BoardStorageLease(directory: busyDir)
+        defer { withExtendedLifetime(lease) {} }
+        busyModel.add("retained while busy")
+        precondition(busyModel.persistenceError != nil && busyModel.tasks.count == 1)
+        precondition(!FileManager.default.fileExists(atPath: busyDir.appendingPathComponent("tasks.json").path))
+    }
+    busyModel.retrySave()
+    precondition(busyModel.persistenceError == nil)
+    var lockFailure = false
+    let lockModel = BoardModel(dataDirectory: busyDir, sources: .synthetic(busyDir), storageFault: { stage in
+        if lockFailure && stage == "lock" { throw NSError(domain: "SyntheticLock", code: 1) }
+    })
+    let beforeLockFailure = try snapshot(busyDir)
+    lockFailure = true; lockModel.add("lock failure")
+    precondition(lockModel.persistenceError != nil && (try! snapshot(busyDir)) == beforeLockFailure)
+    lockFailure = false; lockModel.retrySave()
+    precondition(lockModel.persistenceError == nil)
+    // Equal in-memory snapshots clear only a recovered write error, under baseline verification.
+    for external in ["unchanged", "modified", "deleted", "corrupt"] {
+        let dir = try directory("equal-" + external)
+        var fail = false
+        let model = BoardModel(dataDirectory: dir, sources: .synthetic(dir), storageFault: { stage in
+            if fail && stage == "write" { throw NSError(domain: "SyntheticWrite", code: 1) }
+        })
+        model.add("original")
+        let original = model.tasks
+        fail = true; model.add("failed")
+        precondition(model.persistenceError != nil)
+        if external == "modified" { try JSONEncoder().encode([BoardTask(title: "external")]).write(to: dir.appendingPathComponent("tasks.json")) }
+        if external == "deleted" { try FileManager.default.removeItem(at: dir.appendingPathComponent("tasks.json")) }
+        if external == "corrupt" { try Data("bad".utf8).write(to: dir.appendingPathComponent("tasks.json")) }
+        let before = try? snapshot(dir)
+        model.tasks = original
+        fail = false; model.retrySave()
+        precondition((try? snapshot(dir)) == before)
+        precondition((model.persistenceError == nil) == (external == "unchanged"))
+        if external == "unchanged" { model.add("next"); precondition(model.persistenceError == nil) }
+    }
+    // Backup debt uses the exact pre-commit bytes, including when edits arrive before retry.
+    for stage in ["backupRotate", "backupReplace"] {
+        let dir = try directory(stage)
+        var fail = false
+        let model = BoardModel(dataDirectory: dir, sources: .synthetic(dir), storageFault: { point in
+            if fail && point == stage { throw NSError(domain: "SyntheticBackup", code: 1) }
+        })
+        model.add("original")
+        let previous = try snapshot(dir)
+        fail = true; model.add("committed")
+        let committed = try snapshot(dir)
+        precondition(committed != previous && model.persistenceError?.contains("任务已保存，备份未完成") == true)
+        model.retrySave()
+        precondition(model.persistenceError != nil)
+        fail = false; model.retrySave()
+        precondition(model.persistenceError == nil && (try! snapshot(dir, "tasks.json.bak")) == previous)
+        fail = true; model.add("third")
+        let third = try snapshot(dir)
+        model.add("fourth")
+        precondition((try! snapshot(dir)) == third)
+        precondition(model.persistenceError?.contains("当前修改尚未保存，且上次备份未完成") == true)
+        fail = false; model.retrySave()
+        precondition(model.persistenceError == nil && (try! snapshot(dir, "tasks.json.bak")) == third)
+    }
+    // Failed migration normalizes current edits, keeps original bytes and relationship identity.
+    let repair = try directory("repair")
+    var one = BoardTask(title: "one"); one.isAutoGroup = true; one.projectKey = "/synthetic/project"
+    var two = BoardTask(title: "two"); two.isAutoGroup = true; two.projectKey = one.projectKey
+    var child = BoardTask(title: "child"); child.qoderSessionID = "synthetic"; child.projectKey = one.projectKey; child.parentID = two.id
+    let manual = BoardTask(title: "manual")
+    let original = try JSONEncoder().encode([one, two, child, manual])
+    try original.write(to: repair.appendingPathComponent("tasks.json"))
+    var failRepair = true
+    let model = BoardModel(dataDirectory: repair, sources: .synthetic(repair), storageFault: { point in
+        if failRepair && point == "repairBackup" { throw NSError(domain: "SyntheticRepair", code: 1) }
+    })
+    model.renameTask(manual.id, to: "edited"); model.add("local-new")
+    model.retrySave()
+    precondition(model.persistenceError != nil && model.tasks.filter(\.isAutoGroup).count == 2)
+    failRepair = false; model.retrySave()
+    precondition(model.persistenceError == nil && model.tasks.filter(\.isAutoGroup).count == 1)
+    let owner = model.tasks.first(where: \.isAutoGroup)!
+    precondition(model.tasks.first { $0.id == child.id }?.parentID == owner.id)
+    precondition(model.tasks.contains { $0.id == manual.id && $0.title == "edited" } && model.tasks.contains { $0.title == "local-new" })
+    precondition((try! snapshot(repair, "tasks-before-auto-group-repair.json")) == original)
+    let normalized = try snapshot(repair)
+    model.retrySave()
+    let restored = BoardModel(dataDirectory: repair, sources: .synthetic(repair))
+    precondition(restored.persistenceError == nil && (try! snapshot(repair)) == normalized)
+    // Recovery/repair retry must also reject external changes before copying or normalizing.
+    let repairConflict = try directory("repair-conflict")
+    try original.write(to: repairConflict.appendingPathComponent("tasks.json"))
+    var blocked = true
+    let stale = BoardModel(dataDirectory: repairConflict, sources: .synthetic(repairConflict), storageFault: { point in
+        if blocked && point == "repairBackup" { throw NSError(domain: "SyntheticRepair", code: 2) }
+    })
+    let other = BoardModel(dataDirectory: repairConflict, sources: .synthetic(repairConflict))
+    other.add("other-writer")
+    let external = try snapshot(repairConflict)
+    stale.add("local-retained"); blocked = false; stale.retrySave()
+    precondition(stale.persistenceError?.contains("保存冲突") == true && (try! snapshot(repairConflict)) == external)
+    precondition(stale.tasks.contains { $0.title == "local-retained" })
+    // Two independent processes load the same missing version before either is allowed to save.
+    let processDir = try directory("process-storage"), barrier = try directory("barrier")
+    let children: [Process] = try ["process-A", "process-B"].map { name in
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+        process.arguments = ["--storage-writer-self-test", processDir.path, barrier.path, name]
+        try process.run()
+        // Load one at a time, then release both old-version writers together.
+        // Non-blocking initialization itself may legitimately fail while another holds the lock.
+        let readyDeadline = Date().addingTimeInterval(15)
+        while !FileManager.default.fileExists(atPath: barrier.appendingPathComponent(name + ".ready").path) {
+            precondition(Date() < readyDeadline && process.isRunning, "child failed to load fixture")
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        return process
+    }
+    let deadline = Date().addingTimeInterval(15)
+    while !["process-A", "process-B"].allSatisfy({ FileManager.default.fileExists(atPath: barrier.appendingPathComponent($0 + ".ready").path) }) {
+        precondition(Date() < deadline, "children did not reach barrier")
+        Thread.sleep(forTimeInterval: 0.01)
+    }
+    try Data().write(to: barrier.appendingPathComponent("go"))
+    for process in children { process.waitUntilExit(); precondition(process.terminationStatus == 0) }
+    let results = try ["process-A", "process-B"].map { try JSONSerialization.jsonObject(with: Data(contentsOf: barrier.appendingPathComponent($0 + ".result"))) as! [String: Any] }
+    precondition(results.filter { $0["committed"] as? Bool == true }.count == 1)
+    let disk = try JSONDecoder().decode([BoardTask].self, from: snapshot(processDir))
+    precondition(disk.count == 1 && results.contains { $0["title"] as? String == disk[0].title && $0["committed"] as? Bool == true })
+    print("Storage transaction self-test passed (CAS, lock, backup debt, migration, two-process barrier)")
+}
+
+func runDisplayClockSelfTest() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-clock-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
+    let activity = Date(timeIntervalSince1970: 2_000_000_000)
+    var owner = BoardTask(title: "owner"); owner.isAutoGroup = true; owner.state = .waiting; owner.projectKey = "/synthetic/clock"
+    var human = BoardTask(title: "human"); human.parentID = owner.id; human.qoderSessionID = "human"; human.state = .human; human.lastActivityAt = activity
+    var waiting = BoardTask(title: "waiting"); waiting.parentID = owner.id; waiting.qoderSessionID = "waiting"; waiting.state = .waiting; waiting.lastActivityAt = activity.addingTimeInterval(60)
+    var plain = BoardTask(title: "plain"); plain.state = .ready
+    var done = BoardTask(title: "done"); done.state = .done
+    model.tasks = [owner, human, waiting, plain, done]
+    for offset in [86400.0 - 1, 86400.0, 86400.0 + 1] {
+        let now = activity.addingTimeInterval(offset)
+        let visible = model.visibleChildren(of: owner.id, now: now)
+        let expected: TaskState = offset < 86400 ? .human : .waiting
+        precondition(model.displayState(for: owner, now: now) == expected)
+        precondition(model.summarySessionCount(for: owner, now: now) == visible.filter { $0.state == expected }.count)
+        precondition(model.active(now: now).contains { $0.id == owner.id })
+        precondition(model.completed(now: now).contains { $0.id == done.id })
+        precondition(model.active(now: now).contains { $0.id == plain.id })
+    }
+    for offset in [7 * 86400.0 - 1, 7 * 86400.0, 7 * 86400.0 + 1] {
+        let now = waiting.lastActivityAt.addingTimeInterval(offset)
+        precondition(model.active(now: now).contains { $0.id == owner.id } == (offset < 7 * 86400))
+        precondition(model.visibleChildren(of: owner.id, now: now).isEmpty)
+        precondition(model.displayState(for: owner, now: now) == .waiting)
+        precondition(model.summarySessionCount(for: owner, now: now) == 0)
+    }
+    model.setPinned(human.id)
+    let future = activity.addingTimeInterval(8 * 86400)
+    precondition(model.active(now: future).contains { $0.id == owner.id })
+    precondition(model.displayState(for: owner, now: future) == .human)
+    precondition(model.summarySessionCount(for: owner, now: future) == 1)
+    // An older UI tick is intentionally independent of actual wall time.
+    let priorTick = activity.addingTimeInterval(86399)
+    precondition(model.displayState(for: owner, now: priorTick) == .human)
+    precondition(model.displayState(for: plain, now: future) == .ready)
+    print("Display clock self-test passed (24h/7d boundaries, mixed states, pinned, ordinary tasks)")
+}
+
+if CommandLine.arguments.contains("--storage-writer-self-test") {
+    try runStorageWriterFixture()
+} else if CommandLine.arguments.contains("--storage-transaction-self-test") {
+    try runStorageTransactionSelfTest()
+} else if CommandLine.arguments.contains("--display-clock-self-test") {
+    try runDisplayClockSelfTest()
+} else if CommandLine.arguments.contains("--recovery-ui-self-test") {
+    let labels = RecoveryProjectLabels(paths: ["/synthetic/prod/project", "/synthetic/trial/project", "/a/x", "/b/a/x", nil, "/", "/tail/"])
+    precondition(labels.label(for: "/synthetic/prod/project") == "prod/project")
+    precondition(labels.label(for: "/synthetic/trial/project") == "trial/project")
+    precondition(labels.label(for: "/a/x") != labels.label(for: "/b/a/x"))
+    precondition(labels.label(for: nil) == "项目未提供" && labels.label(for: "/") == "/")
+    precondition(labels.label(for: "/tail/") == labels.label(for: "/tail"))
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-recovery-ui-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: directory) }
     let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
@@ -3241,6 +3590,12 @@ if CommandLine.arguments.contains("--recovery-ui-self-test") {
     let defaults = UserDefaults(suiteName: suite)!
     defer { defaults.removePersistentDomain(forName: suite) }
     model.update(id) { $0.stateSince = Date().addingTimeInterval(-60) }
+    let beforeEmptyHook = model.tasks
+    let savesBeforeEmptyHook = model.savedSnapshotCount
+    defaults.set(500, forKey: "qoderEventLineCount")
+    model.pollQoder(defaults: defaults) // Missing/empty hook input keeps the existing cursor.
+    precondition(defaults.integer(forKey: "qoderEventLineCount") == 500)
+    precondition(model.tasks == beforeEmptyHook && model.savedSnapshotCount == savesBeforeEmptyHook)
     let event: [String: String] = ["session_id": "resume-test", "hook_event_name": "UserPromptSubmit",
                                    "cwd": "/tmp/example", "prompt_preview": "Hook 新问题",
                                    "timestamp": ISO8601DateFormatter().string(from: Date())]
@@ -3252,6 +3607,12 @@ if CommandLine.arguments.contains("--recovery-ui-self-test") {
     precondition(model.tasks.first { $0.id == id }!.state == .waiting)
     precondition(model.tasks.first { $0.id == id }!.lastUserPreview == "Hook 新问题")
     precondition(defaults.integer(forKey: "qoderEventLineCount") == 1)
+    try Data().write(to: directory.appendingPathComponent("qoder-events.jsonl"))
+    let afterNonemptyHook = model.tasks
+    let savesAfterNonemptyHook = model.savedSnapshotCount
+    model.pollQoder(defaults: defaults)
+    precondition(defaults.integer(forKey: "qoderEventLineCount") == 1)
+    precondition(model.tasks == afterNonemptyHook && model.savedSnapshotCount == savesAfterNonemptyHook)
     print("Qoder resume self-test passed")
 } else if CommandLine.arguments.contains("--human-state-self-test") {
     precondition(HumanActionDetector.needsHuman("需要你确认项目目录后我才能继续。"))
