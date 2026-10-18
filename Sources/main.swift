@@ -873,6 +873,7 @@ final class BoardModel: ObservableObject {
     private var loading = true
     private var revision: UInt64 = 0
     private var persistedTasks: [BoardTask]?
+    private var loadedOriginalTasks: [BoardTask]?
     private var knownValidMainData: Data?
     // nil means the file did not exist; establishment is separate from that valid version.
     private var expectedMainData: Data?
@@ -924,6 +925,7 @@ final class BoardModel: ObservableObject {
                 try FileManager.default.copyItem(at: fileURL, to: support.appendingPathComponent("tasks-unreadable-" + UUID().uuidString + ".json"))
             }
             if let loaded = saved ?? recovered {
+                loadedOriginalTasks = loaded
                 tasks = loaded
                 loadedSnapshot = true
                 let repaired = Self.normalizedAutoGroups(loaded)
@@ -952,6 +954,14 @@ final class BoardModel: ObservableObject {
         else if persistenceError == nil { persistedTasks = tasks }
     }
 
+    /// A decoded source snapshot is safe even when protecting/repairing it was blocked.
+    /// Neither an error string nor a missing persistedTasks value means local edits exist.
+    var storageExitSummary: StorageExitSummary {
+        StorageExitSummary(hasUncommittedEdits: tasks != (persistedTasks ?? loadedOriginalTasks ?? []),
+                           backupDebt: pendingBackupData != nil, loadBlocked: loadBlocked,
+                           externalConflict: hasExternalConflict)
+    }
+
     func retrySave() {
         if loadBlocked {
             do {
@@ -973,6 +983,7 @@ final class BoardModel: ObservableObject {
                     try FileManager.default.copyItem(at: fileURL, to: directory.appendingPathComponent("tasks-unreadable-" + UUID().uuidString + ".json"))
                 }
                 if let loaded = saved ?? recovered {
+                    if loadedOriginalTasks == nil { loadedOriginalTasks = loaded }
                     let normalized = Self.normalizedAutoGroups(loaded)
                     let changed = loaded != normalized
                     let repairBackup = directory.appendingPathComponent("tasks-before-auto-group-repair.json")
@@ -1464,6 +1475,23 @@ final class BoardModel: ObservableObject {
     func latestActivityDate(for task: BoardTask, now: Date = Date()) -> Date {
         if task.isConversation { return task.lastActivityAt }
         return visibleChildren(of: task.id, now: now).map(\.lastActivityAt).max() ?? task.lastActivityAt
+    }
+
+    /// One shared conversation identity, without changing any sibling or owner star.
+    @discardableResult
+    func setSessionRetained(_ id: UUID, to retained: Bool, now: Date = Date(),
+                            confirmHiding: () -> Bool) -> Bool {
+        guard let target = tasks.first(where: { $0.id == id }), target.isConversation,
+              target.isPinned != retained else { return false }
+        var candidate = target
+        candidate.isPinned = retained
+        if !retained && !isVisible(candidate, now: now) && !confirmHiding() { return false }
+        // A modal confirmation can run the event loop; resolve identity again afterwards.
+        guard let index = tasks.firstIndex(where: { $0.id == id && $0.isConversation }) else { return false }
+        var updated = tasks
+        updated[index].isPinned = retained
+        tasks = updated
+        return true
     }
 
     func setPinned(_ id: UUID) {
@@ -2250,14 +2278,18 @@ struct TaskCard: View {
                 .help("打开对应会话")
 
                 VStack(spacing: 2) {
-                    Button { model.toggleTaskStar(task.id) } label: {
+                    Button {
+                        if task.isConversation {
+                            model.setSessionRetained(task.id, to: !task.isPinned, confirmHiding: SessionRetentionPrompt.confirmHiding)
+                        } else { model.toggleTaskStar(task.id) }
+                    } label: {
                         Image(systemName: task.isPinned ? "star.fill" : "star")
                             .foregroundStyle(task.isPinned ? theme.accent : theme.secondaryText)
                             .frame(width: 28, height: 25)
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .help(task.isPinned ? "取消主体任务星标" : "星标主体任务")
+                    .help(task.isConversation ? (task.isPinned ? "取消保留显示" : "保留显示") : (task.isPinned ? "取消主体任务星标" : "星标主体任务"))
                     if previewSession != nil {
                         Text(sourceLabel)
                             .font(.system(size: 8, weight: .medium))
@@ -2368,6 +2400,7 @@ struct TaskCard: View {
                 }
             }
             if task.isConversation {
+                SessionRetentionButton(id: task.id, model: model) { menuOpen = false }
                 if task.groupingMode != .auto {
                     Button("恢复自动归组") { model.restoreAutomaticGrouping(task.id); menuOpen = false }
                 }
@@ -2544,6 +2577,7 @@ struct SessionRow: View {
     private var sessionMenu: some View {
         VStack(alignment: .leading, spacing: 3) {
             Button("查看完整详情") { detailTask = task; menuOpen = false }
+            SessionRetentionButton(id: task.id, model: model) { menuOpen = false }
             Divider()
             ForEach(TaskState.allCases) { state in
                 Button(state.rawValue) { model.setState(task.id, to: state); menuOpen = false }
@@ -2565,6 +2599,95 @@ struct SessionRow: View {
         .padding(8)
         .frame(minWidth: 150, alignment: .leading)
         .background(theme.panel)
+    }
+}
+
+enum SessionRetentionPrompt {
+    static func confirmHiding() -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "取消保留后，此会话将从看板隐藏"
+        alert.informativeText = "记录不会删除，可从窗口底部的“找回已隐藏事项”再次保留显示。共享此会话的其他主体也会同步隐藏它。"
+        let cancel = alert.addButton(withTitle: "取消")
+        cancel.keyEquivalent = "\u{1b}"
+        alert.window.defaultButtonCell = cancel.cell as? NSButtonCell
+        alert.addButton(withTitle: "取消保留显示").keyEquivalent = ""
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertSecondButtonReturn
+    }
+}
+
+/// Both standalone cards and grouped rows use the same retention action and confirmation.
+struct SessionRetentionButton: View {
+    let id: UUID
+    @ObservedObject var model: BoardModel
+    var closeMenu: () -> Void
+    private var retained: Bool { model.tasks.first { $0.id == id }?.isPinned ?? false }
+    var body: some View {
+        Button(retained ? "取消保留显示" : "保留显示") {
+            closeMenu()
+            model.setSessionRetained(id, to: !retained, confirmHiding: SessionRetentionPrompt.confirmHiding)
+        }
+    }
+}
+
+struct StorageExitSummary: Equatable {
+    let hasUncommittedEdits: Bool
+    let backupDebt: Bool
+    let loadBlocked: Bool
+    let externalConflict: Bool
+    var requiresConfirmation: Bool { hasUncommittedEdits || backupDebt || loadBlocked || externalConflict }
+    var canRetry: Bool { hasUncommittedEdits || backupDebt }
+    var title: String {
+        if hasUncommittedEdits { return "当前更改尚未保存" }
+        if backupDebt { return "任务已保存，上一版本备份未完成" }
+        return "任务存储尚未恢复正常"
+    }
+    var detail: String {
+        var parts: [String] = []
+        if hasUncommittedEdits { parts.append("当前更改仍在内存中，退出会放弃这些未保存更改。") }
+        if backupDebt { parts.append(hasUncommittedEdits
+            ? "上一版本的备份也尚未补全，退出会放弃本次内存中的待补备份修复。"
+            : "当前任务已保存，但上一版本备份尚未补全；退出会放弃本次内存中的待补备份修复。") }
+        if loadBlocked { parts.append("任务加载或原始快照保护受阻，磁盘文件保持原状。" + (hasUncommittedEdits ? "可显式重试现有恢复与保存流程。" : "没有检测到未保存的本地更改。")) }
+        if externalConflict { parts.append("任务文件已被其他持有者修改。" + (hasUncommittedEdits ? "本地更改未保存；重试不会覆盖外部版本。" : "没有检测到未保存的本地更改。")) }
+        return parts.joined(separator: "\n\n")
+    }
+    var discardTitle: String { hasUncommittedEdits ? "放弃未保存更改并退出" : "仍然退出" }
+}
+
+enum TerminationChoice { case cancel, retry, discard }
+
+/// The production termination entry is also driven directly by synthetic tests.
+/// A retry always returns to a fresh model summary, never a cached dirty flag.
+final class BoardTerminationCoordinator {
+    private let model: BoardModel
+    private var requesting = false
+    init(model: BoardModel) { self.model = model }
+
+    func requestTermination(prompt: (StorageExitSummary) -> TerminationChoice,
+                            restoreWindow: () -> Void) -> NSApplication.TerminateReply {
+        guard !requesting else { return .terminateCancel }
+        requesting = true
+        defer { requesting = false }
+        let summary = model.storageExitSummary
+        guard summary.requiresConfirmation else { return .terminateNow }
+        switch prompt(summary) {
+        case .cancel:
+            restoreWindow()
+            return .terminateCancel
+        case .retry:
+            guard summary.canRetry else { restoreWindow(); return .terminateCancel }
+            model.retrySave()
+            // One explicit retry per termination request. A failure keeps the app visible;
+            // the existing error bar (or a later quit request) offers the next user action.
+            guard !model.storageExitSummary.requiresConfirmation else {
+                restoreWindow()
+                return .terminateCancel
+            }
+            return .terminateNow
+        case .discard:
+            return .terminateNow
+        }
     }
 }
 
@@ -2685,7 +2808,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if !explicitlyHidden { panel.orderFrontRegardless() }
     }
 
-    private let model = BoardModel()
+    private let model: BoardModel
+    private let terminationPrompt: ((StorageExitSummary) -> TerminationChoice)?
+    private let restoreAfterTerminationCancel: (() -> Void)?
+    private lazy var termination = BoardTerminationCoordinator(model: model)
+
+    override convenience init() {
+        self.init(model: BoardModel())
+    }
+
+    /// Synthetic callers supply their own model and UI adapters; no live source is constructed.
+    init(model: BoardModel, terminationPrompt: ((StorageExitSummary) -> TerminationChoice)? = nil,
+         restoreAfterTerminationCancel: (() -> Void)? = nil) {
+        self.model = model
+        self.terminationPrompt = terminationPrompt
+        self.restoreAfterTerminationCancel = restoreAfterTerminationCancel
+        super.init()
+    }
     private var panel: NSPanel!
     private var statusItem: NSStatusItem!
     private var pollTimer: Timer?
@@ -2759,6 +2898,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         edgeHandle.orderOut(nil)
         panel.orderOut(nil)
     }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        termination.requestTermination(prompt: { summary in
+            if let prompt = self.terminationPrompt { return prompt(summary) }
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = summary.title
+            alert.informativeText = summary.detail
+            let cancel = alert.addButton(withTitle: "取消")
+            cancel.keyEquivalent = "\u{1b}"
+            alert.window.defaultButtonCell = cancel.cell as? NSButtonCell
+            if summary.canRetry { alert.addButton(withTitle: "重试保存").keyEquivalent = "" }
+            alert.addButton(withTitle: summary.discardTitle).keyEquivalent = ""
+            sender.activate(ignoringOtherApps: true)
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn { return .cancel }
+            if summary.canRetry && response == .alertSecondButtonReturn { return .retry }
+            return response == (summary.canRetry ? .alertThirdButtonReturn : .alertSecondButtonReturn) ? .discard : .cancel
+        }, restoreWindow: {
+            if let restore = self.restoreAfterTerminationCancel { restore() }
+            else { self.showBoard() }
+        })
+    }
+
     @objc private func quit() { NSApp.terminate(nil) }
 }
 
@@ -3075,7 +3237,252 @@ func runDisplayClockSelfTest() throws {
     print("Display clock self-test passed (24h/7d boundaries, mixed states, pinned, ordinary tasks)")
 }
 
-if CommandLine.arguments.contains("--storage-writer-self-test") {
+func runTerminationProtectionSelfTest() throws {
+    let fixtureBase = ProcessInfo.processInfo.environment["ORBIT_SYNTHETIC_ROOT"]
+        .map { URL(fileURLWithPath: $0, isDirectory: true) } ?? FileManager.default.temporaryDirectory
+    let root = fixtureBase.appendingPathComponent("orbit-termination-" + UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    func directory(_ name: String) throws -> URL {
+        let url = root.appendingPathComponent(name)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
+    func bytes(_ dir: URL, _ name: String = "tasks.json") throws -> Data {
+        try Data(contentsOf: dir.appendingPathComponent(name))
+    }
+    func cancelled(_ model: BoardModel) {
+        let tasks = model.tasks
+        var restored = 0, prompts = 0
+        var delegate: AppDelegate!
+        delegate = AppDelegate(model: model, terminationPrompt: { _ in
+            prompts += 1
+            // The actual delegate entry must reject a nested normal-termination request.
+            precondition(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateCancel)
+            return .cancel
+        }, restoreAfterTerminationCancel: { restored += 1 })
+        precondition(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateCancel)
+        precondition(prompts == 1 && restored == 1 && model.tasks == tasks)
+        let discard = AppDelegate(model: model, terminationPrompt: { _ in .discard }, restoreAfterTerminationCancel: {})
+        precondition(discard.applicationShouldTerminate(NSApplication.shared) == .terminateNow)
+        delegate = nil
+    }
+    let healthyDir = try directory("healthy")
+    let healthy = BoardModel(dataDirectory: healthyDir, sources: .synthetic(healthyDir))
+    let healthyExit = BoardTerminationCoordinator(model: healthy)
+    precondition(healthyExit.requestTermination(prompt: { _ in preconditionFailure("healthy prompt") }, restoreWindow: {}) == .terminateNow)
+    healthy.add("saved")
+    precondition(!healthy.storageExitSummary.requiresConfirmation)
+    precondition(healthyExit.requestTermination(prompt: { _ in preconditionFailure("saved prompt") }, restoreWindow: {}) == .terminateNow)
+    for stage in ["write", "replace"] {
+        let dir = try directory(stage)
+        var fault: String? = nil
+        let model = BoardModel(dataDirectory: dir, sources: .synthetic(dir), storageFault: { point in
+            if fault == point { throw NSError(domain: "SyntheticExit", code: 1) }
+        })
+        model.add("saved")
+        let before = try bytes(dir)
+        fault = stage
+        model.add("local")
+        precondition(model.storageExitSummary.hasUncommittedEdits)
+        cancelled(model)
+        precondition(try! bytes(dir) == before)
+        var prompts = 0
+        let failingRetry = AppDelegate(model: model, terminationPrompt: { summary in
+            precondition(summary.hasUncommittedEdits)
+            prompts += 1
+            return .retry
+        }, restoreAfterTerminationCancel: {})
+        precondition(failingRetry.applicationShouldTerminate(NSApplication.shared) == .terminateCancel)
+        precondition(prompts == 1)
+        precondition(try! bytes(dir) == before)
+        let successfulRetry = AppDelegate(model: model, terminationPrompt: { _ in
+            fault = nil; return .retry
+        }, restoreAfterTerminationCancel: {})
+        precondition(successfulRetry.applicationShouldTerminate(NSApplication.shared) == .terminateNow)
+        precondition(!model.storageExitSummary.requiresConfirmation)
+        let reload = BoardModel(dataDirectory: dir, sources: .synthetic(dir))
+        precondition(reload.tasks == model.tasks)
+    }
+    // A second writer must never be adopted as the local writer's new CAS baseline.
+    let conflictDir = try directory("conflict")
+    let local = BoardModel(dataDirectory: conflictDir, sources: .synthetic(conflictDir))
+    local.add("baseline")
+    let external = BoardModel(dataDirectory: conflictDir, sources: .synthetic(conflictDir))
+    external.add("external")
+    let externalBytes = try bytes(conflictDir)
+    local.add("uncommitted")
+    precondition(local.storageExitSummary.externalConflict && local.storageExitSummary.hasUncommittedEdits)
+    var attempts = 0
+    precondition(BoardTerminationCoordinator(model: local).requestTermination(prompt: { summary in
+        precondition(summary.externalConflict)
+        attempts += 1; return .retry
+    }, restoreWindow: {}) == .terminateCancel)
+    precondition(attempts == 1 && (try! bytes(conflictDir)) == externalBytes)
+    cancelled(local)
+    local.tasks.removeFirst() // Returning exactly to the safe local snapshot removes only the edits risk.
+    precondition(!local.storageExitSummary.hasUncommittedEdits && local.storageExitSummary.externalConflict)
+    precondition(!local.storageExitSummary.canRetry && local.storageExitSummary.requiresConfirmation)
+    cancelled(local)
+    // Backup-only debt is distinct from local uncommitted edits, and preserves its old bytes.
+    let debtDir = try directory("debt")
+    var backupFail = false
+    let debt = BoardModel(dataDirectory: debtDir, sources: .synthetic(debtDir), storageFault: { point in
+        if backupFail && point == "backupReplace" { throw NSError(domain: "SyntheticExit", code: 2) }
+    })
+    debt.add("first"); let first = try bytes(debtDir)
+    backupFail = true; debt.add("second")
+    let committed = try bytes(debtDir), oldBackup = try bytes(debtDir, "tasks.json.bak")
+    precondition(debt.storageExitSummary.backupDebt && !debt.storageExitSummary.hasUncommittedEdits)
+    precondition(debt.storageExitSummary.title == "任务已保存，上一版本备份未完成")
+    precondition(!debt.storageExitSummary.detail.contains("退出会放弃这些未保存更改"))
+    cancelled(debt)
+    precondition((try! bytes(debtDir)) == committed && (try! bytes(debtDir, "tasks.json.bak")) == oldBackup)
+    debt.add("third")
+    precondition(debt.storageExitSummary.backupDebt && debt.storageExitSummary.hasUncommittedEdits)
+    precondition(debt.storageExitSummary.detail.contains("上一版本的备份也尚未补全"))
+    cancelled(debt)
+    backupFail = false
+    precondition(BoardTerminationCoordinator(model: debt).requestTermination(prompt: { _ in .retry }, restoreWindow: {}) == .terminateNow)
+    precondition((try! bytes(debtDir, "tasks.json.bak")) == committed && first != committed)
+    // No decoded baseline: load blocked is a recovery warning, never fabricated lost edits.
+    let blockedDir = try directory("blocked")
+    try Data("unreadable".utf8).write(to: blockedDir.appendingPathComponent("tasks.json"))
+    let blockedBytes = try bytes(blockedDir)
+    let blocked = BoardModel(dataDirectory: blockedDir, sources: .synthetic(blockedDir))
+    precondition(blocked.storageExitSummary.loadBlocked && !blocked.storageExitSummary.hasUncommittedEdits)
+    precondition(!blocked.storageExitSummary.canRetry)
+    cancelled(blocked)
+    blocked.add("local-only")
+    precondition(blocked.storageExitSummary.hasUncommittedEdits && blocked.storageExitSummary.canRetry)
+    var blockedAttempts = 0
+    precondition(BoardTerminationCoordinator(model: blocked).requestTermination(prompt: { _ in
+        blockedAttempts += 1; return .retry
+    }, restoreWindow: {}) == .terminateCancel)
+    precondition(blockedAttempts == 1 && (try! bytes(blockedDir)) == blockedBytes)
+    // When a valid source becomes available, explicit retry merges rather than discards local additions.
+    let restoredSource = BoardTask(title: "recovered-source")
+    try JSONEncoder().encode([restoredSource]).write(to: blockedDir.appendingPathComponent("tasks.json.bak"))
+    precondition(BoardTerminationCoordinator(model: blocked).requestTermination(prompt: { _ in .retry }, restoreWindow: {}) == .terminateNow)
+    precondition(blocked.tasks.contains { $0.title == "local-only" } && blocked.tasks.contains { $0.id == restoredSource.id })
+    // Failed protection of a decoded original is not dirty until actual edits occur.
+    let repairDir = try directory("repair")
+    var one = BoardTask(title: "one"); one.isAutoGroup = true; one.projectKey = repairDir.path
+    var two = BoardTask(title: "two"); two.isAutoGroup = true; two.projectKey = one.projectKey
+    var child = BoardTask(title: "child"); child.qoderSessionID = "repair-child"; child.projectKey = one.projectKey; child.parentID = two.id
+    let original = try JSONEncoder().encode([one, two, child])
+    try original.write(to: repairDir.appendingPathComponent("tasks.json"))
+    var repairFail = true
+    let repair = BoardModel(dataDirectory: repairDir, sources: .synthetic(repairDir), storageFault: { point in
+        if repairFail && point == "repairBackup" { throw NSError(domain: "SyntheticExit", code: 3) }
+    })
+    precondition(repair.storageExitSummary.loadBlocked && !repair.storageExitSummary.hasUncommittedEdits)
+    cancelled(repair)
+    repair.add("local-repair")
+    precondition(repair.storageExitSummary.hasUncommittedEdits)
+    repairFail = false
+    precondition(BoardTerminationCoordinator(model: repair).requestTermination(prompt: { _ in .retry }, restoreWindow: {}) == .terminateNow)
+    precondition(repair.tasks.contains { $0.title == "local-repair" } && repair.tasks.filter(\.isAutoGroup).count == 1)
+    precondition((try! bytes(repairDir, "tasks-before-auto-group-repair.json")) == original)
+    // A normalized snapshot awaiting its first commit is uncommitted, though it was auto-generated.
+    let normalizeDir = try directory("normalize")
+    try original.write(to: normalizeDir.appendingPathComponent("tasks.json"))
+    var normalizeFail = true
+    let normalize = BoardModel(dataDirectory: normalizeDir, sources: .synthetic(normalizeDir), storageFault: { point in
+        if normalizeFail && point == "write" { throw NSError(domain: "SyntheticExit", code: 4) }
+    })
+    precondition(!normalize.storageExitSummary.loadBlocked && normalize.storageExitSummary.hasUncommittedEdits)
+    cancelled(normalize)
+    normalizeFail = false; normalize.retrySave()
+    precondition(!normalize.storageExitSummary.requiresConfirmation)
+    // An unchanged backup source remains safe on disk even when its main-file recovery fails.
+    let recoveryDir = try directory("recovery")
+    let recovered = BoardTask(title: "backup-source")
+    let recoveredBytes = try JSONEncoder().encode([recovered])
+    try recoveredBytes.write(to: recoveryDir.appendingPathComponent("tasks.json.bak"))
+    var recoveryFail = true
+    let recovery = BoardModel(dataDirectory: recoveryDir, sources: .synthetic(recoveryDir), storageFault: { point in
+        if recoveryFail && point == "replace" { throw NSError(domain: "SyntheticExit", code: 5) }
+    })
+    precondition(!recovery.storageExitSummary.hasUncommittedEdits)
+    recovery.renameTask(recovered.id, to: "local-recovery")
+    precondition(recovery.storageExitSummary.hasUncommittedEdits)
+    cancelled(recovery)
+    precondition((try! bytes(recoveryDir, "tasks.json.bak")) == recoveredBytes)
+    recoveryFail = false; recovery.retrySave()
+    precondition(!recovery.storageExitSummary.requiresConfirmation)
+    print("Termination protection self-test passed (production coordinator; native dialogs untested)")
+}
+
+func runSessionRetentionSelfTest() throws {
+    let fixtureBase = ProcessInfo.processInfo.environment["ORBIT_SYNTHETIC_ROOT"]
+        .map { URL(fileURLWithPath: $0, isDirectory: true) } ?? FileManager.default.temporaryDirectory
+    let dir = fixtureBase.appendingPathComponent("orbit-retention-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    var fail = false
+    let model = BoardModel(dataDirectory: dir, sources: .synthetic(dir), storageFault: { point in
+        if fail && point == "write" { throw NSError(domain: "SyntheticRetention", code: 1) }
+    })
+    let now = Date(timeIntervalSince1970: 2_000_000_000)
+    var parent = BoardTask(title: dir.lastPathComponent); parent.isAutoGroup = true; parent.projectKey = dir.path; parent.isPinned = true
+    let shared = BoardTask(title: "shared-owner")
+    var first = BoardTask(title: "first"); first.qoderSessionID = "first"; first.projectKey = dir.path
+    first.parentID = parent.id; first.boundParentIDs = [shared.id]; first.lastActivityAt = now.addingTimeInterval(-8 * 86400)
+    var second = first; second.id = UUID(); second.qoderSessionID = "second"; second.title = "second"
+    model.tasks = [parent, shared, first, second]
+    model.restoreHiddenItem(first.id, now: now); model.restoreHiddenItem(second.id, now: now)
+    let before = model.tasks
+    var confirmations = 0
+    precondition(!model.setSessionRetained(first.id, to: false, now: now) { confirmations += 1; return false })
+    precondition(confirmations == 1 && model.tasks == before)
+    precondition(model.setSessionRetained(first.id, to: false, now: now) { confirmations += 1; return true })
+    precondition(confirmations == 2)
+    for original in before {
+        var expected = original
+        if expected.id == first.id { expected.isPinned = false }
+        precondition(model.tasks.first { $0.id == expected.id } == expected)
+    }
+    precondition(model.hiddenItems(now: now).contains { $0.id == first.id })
+    precondition(!model.visibleChildren(of: parent.id, now: now).contains { $0.id == first.id })
+    precondition(!model.visibleChildren(of: shared.id, now: now).contains { $0.id == first.id })
+    precondition(model.visibleChildren(of: parent.id, now: now).contains { $0.id == second.id })
+    model.restoreHiddenItem(first.id, now: now)
+    precondition(model.visibleChildren(of: shared.id, now: now).contains { $0.id == first.id })
+    // Removing both old pins hides the expired auto-parent without altering its own star.
+    precondition(model.setSessionRetained(first.id, to: false, now: now) { true })
+    precondition(model.setSessionRetained(second.id, to: false, now: now) { true })
+    let currentParent = model.tasks.first { $0.id == parent.id }!
+    precondition(currentParent.isPinned && !model.isVisible(currentParent, now: now))
+    precondition(model.isVisible(currentParent, now: first.lastActivityAt.addingTimeInterval(7 * 86400 - 1)))
+    precondition(!model.isVisible(currentParent, now: first.lastActivityAt.addingTimeInterval(7 * 86400)))
+    // Exactly 24 hours is hidden; just before it, cancellation is immediate and needs no prompt.
+    model.restoreHiddenItem(first.id, now: now)
+    precondition(model.setSessionRetained(first.id, to: false, now: first.lastActivityAt.addingTimeInterval(86400 - 1)) {
+        preconditionFailure("recent cancellation should not prompt")
+    })
+    precondition(model.setSessionRetained(first.id, to: true, now: now) { preconditionFailure("retaining should not prompt") })
+    precondition(!model.setSessionRetained(first.id, to: false, now: first.lastActivityAt.addingTimeInterval(86400)) { false })
+    precondition(!model.setSessionRetained(parent.id, to: false, now: now) { preconditionFailure("owner should not prompt") })
+    precondition(!model.setSessionRetained(UUID(), to: true, now: now) { preconditionFailure("missing should not prompt") })
+    let reloaded = BoardModel(dataDirectory: dir, sources: .synthetic(dir))
+    precondition(reloaded.tasks == model.tasks)
+    fail = true
+    precondition(model.setSessionRetained(first.id, to: false, now: now) { true })
+    precondition(model.persistenceError != nil && model.storageExitSummary.hasUncommittedEdits)
+    precondition(!model.tasks.first { $0.id == first.id }!.isPinned)
+    precondition(BoardTerminationCoordinator(model: model).requestTermination(prompt: { _ in .cancel }, restoreWindow: {}) == .terminateCancel)
+    fail = false; model.retrySave()
+    precondition(!model.storageExitSummary.requiresConfirmation)
+    let restored = BoardModel(dataDirectory: dir, sources: .synthetic(dir))
+    precondition(restored.tasks == model.tasks)
+    print("Session retention self-test passed (shared identity, independent pins, cancel, boundaries, persistence)")
+}
+
+if CommandLine.arguments.contains("--termination-protection-self-test") {
+    try runTerminationProtectionSelfTest()
+} else if CommandLine.arguments.contains("--session-retention-self-test") {
+    try runSessionRetentionSelfTest()
+} else if CommandLine.arguments.contains("--storage-writer-self-test") {
     try runStorageWriterFixture()
 } else if CommandLine.arguments.contains("--storage-transaction-self-test") {
     try runStorageTransactionSelfTest()

@@ -12,7 +12,7 @@
     .hero { padding:34px; border:1px solid var(--line); border-radius:24px; background:linear-gradient(135deg, #1d2e4a, #1a202b 65%); box-shadow:0 20px 60px #0005; }
     .badge { display:inline-block; padding:3px 10px; border-radius:999px; color:#111; background:var(--yellow); font-weight:700; font-size:13px; }
     h1 { margin:14px 0 4px; font-size:34px; letter-spacing:-.04em; } h2 { margin-top:42px; font-size:23px; } h3 { margin-top:26px; font-size:18px; }
-    p, li { color:var(--muted); } strong { color:var(--text); }
+    p, li { color:var(--muted); } strong { color:var(--text); } a { color:var(--accent); }
     .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; margin:22px 0; }
     .card { padding:18px; border:1px solid var(--line); border-radius:16px; background:var(--panel); } .card h3 { margin:0 0 5px; }
     code, .path { padding:2px 6px; border-radius:6px; background:#0b0e13; color:#c9d9ff; font-family:ui-monospace,SFMono-Regular,monospace; font-size:.9em; }
@@ -39,7 +39,7 @@
     <div class="card"><h3>Cursor</h3><p>任务板会读取当前用户已跟踪的 Cursor 本地记录。首次使用后等待几秒，最近会话会出现在对应项目组里。</p></div>
     <div class="card"><h3>Codex</h3><p>任务板会读取本机最近七天的 Codex 任务，并按项目目录归组。发送消息后显示“等待 AI”，回复结束后显示“待我处理”；点击会话可跳转到 Codex 中对应的任务。</p></div>
   </div>
-  <p>主体任务下可以挂多个会话。最近活跃的会话会显示在最上方；每条会话第一行是最后一次由你输入的内容（最多 30 字，超出显示省略号），第二行右侧是会话名称。展开后按活跃时间从新到旧排列。超过一天未更新的会话会隐藏，项目分组超过七天没有更新也会隐藏。</p>
+  <p>主体任务下可以挂多个会话。最近活跃的会话会显示在最上方；每条会话第一行是最后一次由你输入的内容（最多 30 字，超出显示省略号），第二行右侧是会话名称。展开后按活跃时间从新到旧排列。未保留显示的会话超过一天未更新会隐藏；自动项目分组在所有会话超过七天未更新、且没有保留会话时也会隐藏。</p>
 
   <h2>三、日常操作</h2>
   <ul>
@@ -48,6 +48,7 @@
     <li>点击任务组顶部的星标，把主体任务加入星标筛选。标题区的星标按钮可以切换“只看星标”。</li>
     <li>打开主体任务右侧的 <strong>···</strong> 菜单，选择“绑定会话”，可以搜索 Qoder / Cursor / Codex 会话，也能找到 Codex 左侧“最近”里的旧任务。超过一天未更新的旧任务绑定后会自动保留显示；会话菜单中的“移出主体任务”可以撤销归组。</li>
     <li>AI 回复明确要求你澄清问题或手动操作时，会话会自动显示“需人工”；如果识别不准确，可在任务或会话右侧的 <strong>···</strong> 菜单里手动修改。主体任务摘要里的会话数只统计当前状态对应的会话。</li>
+    <li>旧会话暂时看不到时，可从窗口底部打开<strong>找回已隐藏事项</strong>；具体范围见<a href="#hidden-recovery">“昨天的会话不见了”</a>。</li>
     <li>点击调色板按钮，可以切换“默认深色”“星夜电气”和“云白玻璃”皮肤。云白玻璃使用浅色渐变、半透明白卡片和蓝色强调；星夜电气的角色与云层插画包含在应用里，离线也能显示。选择会自动记住。</li>
   </ul>
 
@@ -57,6 +58,11 @@
 
   <h2>五、常见问题</h2>
   <h3>启动后没有会话</h3><p>确认 Cursor、Qoder 或 Codex 已经产生本地会话；Qoder 需要先运行连接脚本并重启。任务板每 5 秒同步一次，也可以退出后重新打开。</p>
+  <h3 id="hidden-recovery">昨天的会话不见了</h3>
+  <p><strong>隐藏不等于删除。</strong>在窗口底部点击<strong>找回已隐藏事项</strong>，可按完整名称、来源或项目路径搜索。列表会显示隐藏原因、最后活动时间及可区分的项目路径；同名时可先点<strong>查看完整详情</strong>核对。</p>
+  <p>对单条会话选择<strong>保留显示</strong>，只保留这一条；对自动主体选择<strong>恢复主体及隐藏会话</strong>，会保留该主体下所有已隐藏会话。保留状态属于会话本身，同一会话所属的其他主体也会看到它；恢复不会取消其他会话已有的保留。</p>
+  <p>不再需要一直显示时，打开该会话的 <strong>···</strong> 菜单，选择<strong>取消保留显示</strong>。这只改变当前会话，不取消其他会话的保留，也不改变主体星标。若它会立即隐藏，程序会先提示并允许取消；隐藏后仍可从底部找回。</p>
+  <p>如果同时出现保存错误，请先处理保存问题；找回隐藏事项不能替代保存。</p>
   <h3>应用被 macOS 拦截</h3><p>不要直接双击反复尝试，请在 Finder 中 Control 点击应用，选择“打开”。如果公司电脑有安全策略，请联系管理员允许本地未签名应用。</p>
   <h3>窗口不见了</h3><p>点击菜单栏里的任务板图标，选择“显示任务板”。</p>
   <h3>如何更新</h3><p>退出旧版本，把新版本应用替换进去。任务数据在 Application Support 中，正常更新不会删除。</p>
