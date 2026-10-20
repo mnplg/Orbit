@@ -245,6 +245,24 @@ struct BoardTask: Identifiable, Codable, Equatable {
     }
 }
 
+enum WorkspaceGrouping {
+    static let temporaryKey = "orbit:temporary-sessions"
+    static let temporaryTitle = "临时会话"
+    static func isTemporaryWorkspace(_ path: String) -> Bool {
+        let parts = URL(fileURLWithPath: path).standardizedFileURL.pathComponents
+        guard parts.count >= 3 else { return false }
+        return parts[parts.count - 3] == "Qoder" &&
+            parts[parts.count - 2].range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil &&
+            parts.last!.range(of: #"^[0-9a-f]{8}$"#, options: .regularExpression) != nil
+    }
+    static func key(for path: String) -> String {
+        path == temporaryKey || isTemporaryWorkspace(path) ? temporaryKey : path
+    }
+    static func title(for key: String) -> String {
+        key == temporaryKey ? temporaryTitle : URL(fileURLWithPath: key).lastPathComponent
+    }
+}
+
 struct CursorSession: Identifiable {
     let path: String
     let title: String
@@ -906,8 +924,12 @@ final class BoardModel: ObservableObject {
     @Published private(set) var hasLoadedCodexRecent = false
 
     private let fileURL: URL
+    private let ignoredURL: URL
+    private var ignoredSessions: [String: Double] = [:]
+    private var persistedIgnoredSessions: [String: Double] = [:]
+    private var expectedIgnoredData: Data?
     private let qoderEventsURL: URL
-    private let sources: BoardSources
+    fileprivate let sources: BoardSources
     private var internalCodexIDs: Set<String> = []
     private var loading = true
     private var revision: UInt64 = 0
@@ -944,6 +966,7 @@ final class BoardModel: ObservableObject {
             .appendingPathComponent("DeskFocusBoard", isDirectory: true)
         SyntheticAccess.check(support)
         fileURL = support.appendingPathComponent("tasks.json")
+        ignoredURL = support.appendingPathComponent("ignored-sessions.json")
         qoderEventsURL = self.sources.hookURL ?? support.appendingPathComponent("qoder-events.jsonl")
         var needsInitialSave = false
         do {
@@ -951,6 +974,13 @@ final class BoardModel: ObservableObject {
             try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
             let lease = try acquireStorageLease()
             defer { withExtendedLifetime(lease) {} }
+            if FileManager.default.fileExists(atPath: ignoredURL.path) {
+                let data = try Data(contentsOf: ignoredURL)
+                ignoredSessions = try JSONDecoder().decode([String: Double].self, from: data)
+                guard ignoredSessions.values.allSatisfy({ $0.isFinite }) else { throw CocoaError(.fileReadCorruptFile) }
+                persistedIgnoredSessions = ignoredSessions
+                expectedIgnoredData = data
+            }
             let main = try readMainData()
             expectedMainData = main
             hasStorageBaseline = true
@@ -996,7 +1026,7 @@ final class BoardModel: ObservableObject {
     /// A decoded source snapshot is safe even when protecting/repairing it was blocked.
     /// Neither an error string nor a missing persistedTasks value means local edits exist.
     var storageExitSummary: StorageExitSummary {
-        StorageExitSummary(hasUncommittedEdits: tasks != (persistedTasks ?? loadedOriginalTasks ?? []),
+        StorageExitSummary(hasUncommittedEdits: tasks != (persistedTasks ?? loadedOriginalTasks ?? []) || ignoredSessions != persistedIgnoredSessions,
                            backupDebt: pendingBackupData != nil, loadBlocked: loadBlocked,
                            externalConflict: hasExternalConflict)
     }
@@ -1010,6 +1040,14 @@ final class BoardModel: ObservableObject {
                 let backup = directory.appendingPathComponent("tasks.json.bak")
                 let lease = try acquireStorageLease()
                 defer { withExtendedLifetime(lease) {} }
+                if !hasStorageBaseline {
+                    if FileManager.default.fileExists(atPath: ignoredURL.path) {
+                        let data = try Data(contentsOf: ignoredURL)
+                        let decoded = try JSONDecoder().decode([String: Double].self, from: data)
+                        guard decoded.values.allSatisfy({ $0.isFinite }) else { throw CocoaError(.fileReadCorruptFile) }
+                        ignoredSessions = decoded; persistedIgnoredSessions = decoded; expectedIgnoredData = data
+                    }
+                }
                 let main = try readMainData()
                 if hasStorageBaseline { try validateStorageBaseline(main) }
                 else { expectedMainData = main; hasStorageBaseline = true }
@@ -1090,7 +1128,8 @@ final class BoardModel: ObservableObject {
     }
 
     private func validateStorageBaseline(_ actual: Data?) throws {
-        guard hasStorageBaseline, actual == expectedMainData, !hasExternalConflict else {
+        let ignoredData = FileManager.default.fileExists(atPath: ignoredURL.path) ? try Data(contentsOf: ignoredURL) : nil
+        guard hasStorageBaseline, actual == expectedMainData, ignoredData == expectedIgnoredData, !hasExternalConflict else {
             hasExternalConflict = true
             throw BoardStorageFailure.conflict
         }
@@ -1117,7 +1156,7 @@ final class BoardModel: ObservableObject {
     private func save() {
         guard !loading, !loadBlocked else { return }
         if batchDepth > 0 { pendingSave = true; return }
-        guard persistedTasks != tasks || persistenceError != nil || pendingBackupData != nil else { return }
+        guard persistedTasks != tasks || ignoredSessions != persistedIgnoredSessions || persistenceError != nil || pendingBackupData != nil else { return }
         let saveStarted = Date()
         var phaseStarted = saveStarted
         lastSavePhaseMilliseconds = [:]
@@ -1133,6 +1172,14 @@ final class BoardModel: ObservableObject {
             try validateStorageBaseline(previous)
             // Repair the original debt before accepting a further commit; never replace its source.
             try finishPendingBackup(to: backup)
+            if ignoredSessions != persistedIgnoredSessions {
+                let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+                let ignoredData = try encoder.encode(ignoredSessions)
+                try storageFault?("ignoredWrite")
+                try ignoredData.write(to: ignoredURL, options: .atomic)
+                expectedIgnoredData = ignoredData
+                persistedIgnoredSessions = ignoredSessions
+            }
             if persistedTasks == tasks {
                 persistenceError = nil
                 return
@@ -1173,7 +1220,9 @@ final class BoardModel: ObservableObject {
                 let updated = batchTasks!
                 batchTasks = nil
                 pendingSave = false
+                let changed = updated != storedTasks
                 tasks = updated
+                if !changed && ignoredSessions != persistedIgnoredSessions { save() }
             }
         }
         operation()
@@ -1278,6 +1327,82 @@ final class BoardModel: ObservableObject {
         }
     }
 
+    private func sessionKeys(_ task: BoardTask) -> [String] {
+        [task.qoderSessionID.map { "qoder:" + $0 }, task.cursorPath.map { "cursor:" + $0 },
+         task.codexThreadID.map { "codex:" + $0 }].compactMap { $0 }
+    }
+
+    private func shouldIgnore(_ key: String, activity: Date) -> Bool {
+        guard !loadBlocked else { return true }
+        guard let cutoff = ignoredSessions[key] else { return false }
+        guard activity.timeIntervalSinceReferenceDate > cutoff else { return true }
+        ignoredSessions.removeValue(forKey: key)
+        save()
+        return false
+    }
+
+    private func isIgnored(_ task: BoardTask) -> Bool {
+        sessionKeys(task).contains { key in
+            ignoredSessions[key].map { task.lastActivityAt.timeIntervalSinceReferenceDate <= $0 } ?? false
+        }
+    }
+
+    func hasRecentActivity(_ session: BoardTask, now: Date) -> Bool {
+        session.isConversation && !isInternalConversation(session) && !isIgnored(session) &&
+            now.timeIntervalSince(session.lastActivityAt) < 24 * 3600 &&
+            (session.qoderSessionID == nil || session.qoderObservedLines > 0)
+    }
+
+    func inactiveAutoGroups(now: Date = Date()) -> [BoardTask] {
+        tasks.filter { group in
+            guard group.isAutoGroup, !group.isConversation, group.parentID == nil,
+                  group.boundParentIDs.isEmpty, !group.isPinned, !group.isTitleCustomized else { return false }
+            let sessions = children(of: group.id)
+            // Any explicit/shared ownership protects the group and its sessions.
+            return sessions.allSatisfy { $0.isConversation && $0.groupingMode == .auto && $0.boundParentIDs.isEmpty &&
+                $0.parentID == group.id && !hasRecentActivity($0, now: now) }
+        }
+    }
+
+    func inactiveAutoGroupCount(now: Date = Date()) -> Int { inactiveAutoGroups(now: now).count }
+
+    @discardableResult
+    func cleanInactiveAutoGroups(now: Date = Date()) -> Int {
+        guard !loadBlocked, persistenceError == nil, persistedTasks == tasks,
+              ignoredSessions == persistedIgnoredSessions, batchDepth == 0 else {
+            if persistenceError == nil { persistenceError = "请先完成保存或恢复，再清理自动分组。" }
+            return 0
+        }
+        // CLI cleanup runs before the first poll; identify existing internal agents from metadata too.
+        if let ids = CodexReader.internalThreadIDs(databaseURL: sources.codexDatabase) { internalCodexIDs.formUnion(ids) }
+        let groups = inactiveAutoGroups(now: now)
+        guard !groups.isEmpty else { return 0 }
+        let groupIDs = Set(groups.map(\.id))
+        let childrenToRemove = tasks.filter { $0.parentID.map { groupIDs.contains($0) } ?? false }
+        let deleted = groupIDs.union(childrenToRemove.map(\.id))
+        do {
+            let lease = try acquireStorageLease()
+            defer { withExtendedLifetime(lease) {} }
+            try validateStorageBaseline(try readMainData())
+            let directory = fileURL.deletingLastPathComponent().appendingPathComponent("cleanup-backups/" + UUID().uuidString)
+            try storageFault?("cleanupBackup")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            for source in [fileURL, fileURL.appendingPathExtension("bak"), ignoredURL] where FileManager.default.fileExists(atPath: source.path) {
+                try FileManager.default.copyItem(at: source, to: directory.appendingPathComponent(source.lastPathComponent))
+            }
+        } catch {
+            recordStorageFailure(error, prefix: "清理前备份失败，未清理")
+            return 0
+        }
+        for child in childrenToRemove {
+            for key in sessionKeys(child) { ignoredSessions[key] = now.timeIntervalSinceReferenceDate }
+        }
+        var remaining = tasks.filter { !deleted.contains($0.id) }
+        for index in remaining.indices { remaining[index].boundParentIDs.removeAll { groupIDs.contains($0) } }
+        tasks = remaining // save() commits ignored-sessions first, then the task snapshot under one lease.
+        return persistenceError == nil && persistedTasks == tasks ? groups.count : 0
+    }
+
     func remove(_ id: UUID) {
         for index in tasks.indices {
             if tasks[index].parentID == id {
@@ -1375,9 +1500,9 @@ final class BoardModel: ObservableObject {
             candidate.projectKey = recent.projectKey
             candidate.lastActivityAt = recent.modified
             candidate.state = .ready
-            return candidate
+            return isIgnored(candidate) ? nil : candidate
         }
-        return (tasks.filter { $0.isConversation && !isInternalConversation($0) && !$0.belongs(to: parentID) } + recentCandidates)
+        return (tasks.filter { $0.isConversation && !isInternalConversation($0) && !isIgnored($0) && !$0.belongs(to: parentID) } + recentCandidates)
             .sorted {
                 if $0.lastActivityAt != $1.lastActivityAt { return $0.lastActivityAt > $1.lastActivityAt }
                 return $0.id.uuidString < $1.id.uuidString
@@ -1411,13 +1536,17 @@ final class BoardModel: ObservableObject {
     /// Consolidate only automatic ownership; explicit manual bindings remain intact.
     static func normalizedAutoGroups(_ original: [BoardTask]) -> [BoardTask] {
         var result = original
-        let automatic = original.filter { $0.isAutoGroup && !$0.isConversation && $0.projectKey?.isEmpty == false }
+        for index in result.indices {
+            if let key = result[index].projectKey { result[index].projectKey = WorkspaceGrouping.key(for: key) }
+        }
+        let normalized = result
+        let automatic = normalized.filter { $0.isAutoGroup && !$0.isConversation && $0.projectKey?.isEmpty == false }
         let oldIDs = Set(automatic.map(\.id))
         var byKey = Dictionary(grouping: automatic, by: { $0.projectKey! })
-        for child in original where child.isConversation {
+        for child in normalized where child.isConversation {
             guard let parent = child.parentID, oldIDs.contains(parent),
                   let key = child.projectKey, !key.isEmpty, byKey[key] == nil else { continue }
-            var group = BoardTask(title: URL(fileURLWithPath: key).lastPathComponent)
+            var group = BoardTask(title: WorkspaceGrouping.title(for: key))
             group.projectKey = key
             group.isAutoGroup = true
             group.createdAt = child.createdAt
@@ -1443,7 +1572,7 @@ final class BoardModel: ObservableObject {
                 result[index].title = customized.title
                 result[index].isTitleCustomized = true
             } else {
-                result[index].title = URL(fileURLWithPath: key).lastPathComponent
+                result[index].title = WorkspaceGrouping.title(for: key)
             }
             result[index].isPinned = groups.contains { $0.isPinned }
             for group in groups.dropFirst() {
@@ -1471,6 +1600,7 @@ final class BoardModel: ObservableObject {
     }
 
     private func ensureProjectParent(for childID: UUID, key: String, title: String) {
+        let key = WorkspaceGrouping.key(for: key)
         guard !key.isEmpty, let child = tasks.first(where: { $0.id == childID }), child.groupingMode == .auto else { return }
         if let parentID = child.parentID,
            let parent = tasks.first(where: { $0.id == parentID }), !parent.isAutoGroup { return }
@@ -1478,7 +1608,7 @@ final class BoardModel: ObservableObject {
         if let existing = tasks.first(where: { $0.isAutoGroup && !$0.isConversation && $0.projectKey == key }) {
             parentID = existing.id
         } else {
-            var parent = BoardTask(title: URL(fileURLWithPath: key).lastPathComponent)
+            var parent = BoardTask(title: WorkspaceGrouping.title(for: key))
             parent.projectKey = key
             parent.isAutoGroup = true
             parentID = parent.id
@@ -1506,7 +1636,7 @@ final class BoardModel: ObservableObject {
     }
 
     func visibleChildren(of id: UUID, now: Date = Date()) -> [BoardTask] {
-        children(of: id).filter { !isInternalConversation($0) && now.timeIntervalSince($0.lastActivityAt) < 24 * 3600 }
+        children(of: id).filter { !isInternalConversation($0) && !isIgnored($0) && now.timeIntervalSince($0.lastActivityAt) < 24 * 3600 }
     }
 
     func latestActivityDate(for task: BoardTask, now: Date = Date()) -> Date {
@@ -1537,7 +1667,7 @@ final class BoardModel: ObservableObject {
 
     /// Recheck the selected identity and ownership without substituting another session.
     func validatedNavigationTarget(_ selected: BoardTask, for owner: BoardTask, now: Date = Date()) -> BoardTask? {
-        guard let current = tasks.first(where: { $0.id == selected.id }), !isInternalConversation(current), hasNavigationSource(current),
+        guard let current = tasks.first(where: { $0.id == selected.id }), !isInternalConversation(current), !isIgnored(current), hasNavigationSource(current),
               current.cursorPath == selected.cursorPath, current.qoderSessionID == selected.qoderSessionID,
               current.codexThreadID == selected.codexThreadID,
               let currentOwner = tasks.first(where: { $0.id == owner.id }) else { return nil }
@@ -1583,7 +1713,7 @@ final class BoardModel: ObservableObject {
     }
 
     func isVisible(_ task: BoardTask, now: Date = Date()) -> Bool {
-        if isInternalConversation(task) { return false }
+        if isInternalConversation(task) || isIgnored(task) { return false }
         if task.isConversation { return now.timeIntervalSince(task.lastActivityAt) < 24 * 3600 }
         guard task.isAutoGroup else { return true }
         let allSessions = children(of: task.id)
@@ -1617,6 +1747,7 @@ final class BoardModel: ObservableObject {
     }
 
     func importCursor(_ session: CursorSession) {
+        guard !shouldIgnore("cursor:" + session.path, activity: session.modified) else { return }
         guard !tasks.contains(where: { $0.cursorPath == session.path }) else { return }
         var task = BoardTask(title: session.title)
         task.cursorPath = session.path
@@ -1644,14 +1775,16 @@ final class BoardModel: ObservableObject {
     private func mergeCursor(_ incoming: [CursorSession], observations: [String: CursorObservation]) {
         let sessions = Dictionary(uniqueKeysWithValues: incoming.map { ($0.path, $0) })
         for task in tasks where task.cursorPath != nil {
-            guard let path = task.cursorPath, let session = sessions[path] else { continue }
+            guard let path = task.cursorPath, let session = sessions[path],
+                  !shouldIgnore("cursor:" + path, activity: session.modified) else { continue }
             if task.lastUserPreview != session.lastUserPreview { update(task.id) { $0.lastUserPreview = session.lastUserPreview } }
             if task.projectKey != session.projectKey { update(task.id) { $0.projectKey = session.projectKey } }
             ensureProjectParent(for: task.id, key: session.projectKey, title: session.projectTitle)
         }
         for index in tasks.indices {
             guard let path = tasks[index].cursorPath, let observation = observations[path],
-                  observation.count > tasks[index].observedLines else { continue }
+                  observation.count > tasks[index].observedLines,
+                  !shouldIgnore("cursor:" + path, activity: observation.modified) else { continue }
             tasks[index].observedLines = observation.count
             tasks[index].lastActivityAt = min(observation.modified, Date())
             if tasks[index].state != .done && tasks[index].state != observation.state {
@@ -1667,15 +1800,18 @@ final class BoardModel: ObservableObject {
         performBatch { mergeQoderEvents(events, defaults: defaults) }
     }
 
-    private func mergeQoderEvents(_ events: [[String: Any]], defaults: UserDefaults) {
+    fileprivate func mergeQoderEvents(_ events: [[String: Any]], defaults: UserDefaults) {
         // No events cannot advance the cursor; avoid loading preferences for hook-free polls.
-        guard !events.isEmpty else { return }
+        guard !events.isEmpty, !loadBlocked else { return }
         let savedCount = defaults.integer(forKey: "qoderEventLineCount")
         let oldCount = events.count < savedCount ? 0 : savedCount
         guard events.count > oldCount else { return }
         for event in events.dropFirst(oldCount) {
             guard let sessionID = event["session_id"] as? String, !sessionID.isEmpty,
                   let eventName = event["hook_event_name"] as? String else { continue }
+            // Missing timestamps must not let replayed hooks revive ignored sessions.
+            let activity = QoderReader.timestamp(event["timestamp"]) ?? .distantPast
+            guard !shouldIgnore("qoder:" + sessionID, activity: activity) else { continue }
             let nextState: TaskState
             switch eventName {
             case "UserPromptSubmit": nextState = .waiting
@@ -1696,7 +1832,8 @@ final class BoardModel: ObservableObject {
                 task.lastUserPreview = userInputPreview(preview)
                 task.projectKey = URL(fileURLWithPath: cwd).standardizedFileURL.path
                 task.state = nextState
-                task.stateSince = Date()
+                task.stateSince = activity
+                task.lastActivityAt = activity
                 tasks.insert(task, at: 0)
                 childID = task.id
             }
@@ -1709,13 +1846,13 @@ final class BoardModel: ObservableObject {
                let preview = event["prompt_preview"] as? String, !preview.isEmpty {
                 tasks[index].lastUserPreview = userInputPreview(preview)
             }
-            let promptTime = QoderReader.timestamp(event["timestamp"]) ?? Date()
+            let promptTime = activity
             let newPrompt = eventName == "UserPromptSubmit" && promptTime > tasks[index].stateSince
             if (tasks[index].state != .done || newPrompt), tasks[index].state != nextState {
                 tasks[index].state = nextState
                 tasks[index].stateSince = Date()
             }
-            tasks[index].lastActivityAt = Date()
+            tasks[index].lastActivityAt = max(tasks[index].lastActivityAt, min(activity, Date()))
         }
         defaults.set(events.count, forKey: "qoderEventLineCount")
     }
@@ -1726,7 +1863,7 @@ final class BoardModel: ObservableObject {
         performBatch { mergeQoderTranscripts(sessions) }
     }
 
-    private func mergeQoderTranscripts(_ sessions: [QoderSession]) {
+    fileprivate func mergeQoderTranscripts(_ sessions: [QoderSession]) {
         guard !sessions.isEmpty else { return }
         var rows = tasks
         let originalCount = rows.count
@@ -1737,27 +1874,30 @@ final class BoardModel: ObservableObject {
             byID[rows[index].id] = index
             if let sessionID = rows[index].qoderSessionID, bySession[sessionID] == nil { bySession[sessionID] = index }
             if rows[index].isAutoGroup && !rows[index].isConversation, let key = rows[index].projectKey,
-               automatic[key] == nil { automatic[key] = rows[index].id }
+               automatic[WorkspaceGrouping.key(for: key)] == nil { automatic[WorkspaceGrouping.key(for: key)] = rows[index].id }
         }
         func ensureParent(_ index: Int, key: String) {
+            let key = WorkspaceGrouping.key(for: key)
             guard !key.isEmpty && rows[index].groupingMode == .auto else { return }
             if let parentID = rows[index].parentID, let parentIndex = byID[parentID], !rows[parentIndex].isAutoGroup { return }
             let parentID: UUID
             if let existing = automatic[key] { parentID = existing }
             else {
-                var parent = BoardTask(title: URL(fileURLWithPath: key).lastPathComponent)
+                var parent = BoardTask(title: WorkspaceGrouping.title(for: key))
                 parent.projectKey = key; parent.isAutoGroup = true
                 parentID = parent.id
                 byID[parentID] = rows.count; automatic[key] = parentID; rows.append(parent)
             }
+            rows[index].projectKey = key
             rows[index].parentID = parentID
         }
         let now = Date()
         for session in sessions {
+            guard !shouldIgnore("qoder:" + session.id, activity: session.modified) else { continue }
             let index: Int
             if let existing = bySession[session.id] {
                 index = existing
-                rows[index].projectKey = session.projectKey
+                rows[index].projectKey = WorkspaceGrouping.key(for: session.projectKey)
                 rows[index].lastUserPreview = session.lastUserPreview
                 ensureParent(index, key: session.projectKey)
                 let hasNewPrompt = session.lastPromptAt.map { $0 > rows[index].stateSince } ?? false
@@ -1771,7 +1911,7 @@ final class BoardModel: ObservableObject {
             } else {
                 var task = BoardTask(title: session.title)
                 task.qoderSessionID = session.id; task.lastUserPreview = session.lastUserPreview
-                task.projectKey = session.projectKey; task.qoderObservedLines = session.lineCount
+                task.projectKey = WorkspaceGrouping.key(for: session.projectKey); task.qoderObservedLines = session.lineCount
                 task.state = session.state; task.stateSince = session.modified; task.lastActivityAt = min(session.modified, now)
                 index = rows.count; bySession[session.id] = index; byID[task.id] = index; rows.append(task)
                 ensureParent(index, key: session.projectKey)
@@ -1783,6 +1923,7 @@ final class BoardModel: ObservableObject {
     func mergeCodex(_ sessions: [CodexSession]) {
         precondition(Thread.isMainThread, "Codex model merges must run on the main thread")
         for session in sessions where !internalCodexIDs.contains(session.id) {
+            guard !shouldIgnore("codex:" + session.id, activity: session.modified) else { continue }
             if let index = tasks.firstIndex(where: { $0.codexThreadID == session.id }) {
                 let childID = tasks[index].id
                 if tasks[index].projectKey != session.projectKey {
@@ -1938,6 +2079,7 @@ struct BoardView: View {
     @State private var newTitle = ""
     @State private var showCompleted = false
     @State private var showNewTaskField = false
+    @State private var showCleanupConfirmation = false
     @State private var showStarredOnly = false
     @State private var now = Date()
 
@@ -2014,6 +2156,12 @@ struct BoardView: View {
             }
         }
         .frame(minWidth: 350, minHeight: 430)
+        .alert("清理无活跃自动分组？", isPresented: $showCleanupConfirmation) {
+            Button("清理", role: .destructive) { model.cleanInactiveAutoGroups(now: Date()) }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("当前有 \(model.inactiveAutoGroupCount(now: now)) 个可清理分组。清理前会备份；会话有新活动时会重新出现；手动任务、手动绑定、改名和星标分组不受影响。")
+        }
         .preferredColorScheme(theme.isLight ? .light : .dark)
         .environment(\.boardTheme, theme)
         .onReceive(Timer.publish(every: 30, on: .main, in: .common).autoconnect()) { now = $0 }
@@ -2052,6 +2200,16 @@ struct BoardView: View {
                     .font(.system(size: 10)).foregroundStyle(theme.secondaryText.opacity(0.9))
             }
             Spacer()
+            Button { showCleanupConfirmation = true } label: {
+                Image(systemName: "trash.slash")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(theme.secondaryText)
+                    .frame(width: 28, height: 28)
+            }
+            .buttonStyle(.plain)
+            .disabled(model.inactiveAutoGroupCount(now: now) == 0)
+            .help("清理无活跃会话的自动分组")
+            .accessibilityLabel("清理无活跃自动分组")
             Menu {
                 ForEach(BoardSkin.allCases) { option in
                     Button {
@@ -2893,8 +3051,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc private func quit() { NSApp.terminate(nil) }
 }
 
+enum SyntheticFixture {
+    static var root: URL {
+        guard let path = ProcessInfo.processInfo.environment["ORBIT_SYNTHETIC_ROOT"] else {
+            preconditionFailure("Self-tests require an explicit synthetic fixture root")
+        }
+        return URL(fileURLWithPath: path, isDirectory: true)
+    }
+}
+
 func runPersistenceSelfTest() throws {
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-storage-" + UUID().uuidString)
+    let directory = SyntheticFixture.root.appendingPathComponent("orbit-storage-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
     let main = directory.appendingPathComponent("tasks.json")
@@ -3003,7 +3170,7 @@ func runStorageWriterFixture() throws {
 }
 
 func runStorageTransactionSelfTest() throws {
-    let root = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-transactions-" + UUID().uuidString)
+    let root = SyntheticFixture.root.appendingPathComponent("orbit-transactions-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: root) }
     func directory(_ name: String) throws -> URL {
@@ -3167,7 +3334,7 @@ func runStorageTransactionSelfTest() throws {
 }
 
 func runDisplayClockSelfTest() throws {
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-clock-" + UUID().uuidString)
+    let directory = SyntheticFixture.root.appendingPathComponent("orbit-clock-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: directory) }
     let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
     let activity = Date(timeIntervalSince1970: 2_000_000_000)
@@ -3211,7 +3378,7 @@ func runDisplayClockSelfTest() throws {
 
 func runTerminationProtectionSelfTest() throws {
     let fixtureBase = ProcessInfo.processInfo.environment["ORBIT_SYNTHETIC_ROOT"]
-        .map { URL(fileURLWithPath: $0, isDirectory: true) } ?? FileManager.default.temporaryDirectory
+        .map { URL(fileURLWithPath: $0, isDirectory: true) } ?? SyntheticFixture.root
     let root = fixtureBase.appendingPathComponent("orbit-termination-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: root) }
@@ -3386,7 +3553,148 @@ func runTerminationProtectionSelfTest() throws {
     print("Termination protection self-test passed (production coordinator; native dialogs untested)")
 }
 
-if CommandLine.arguments.contains("--codex-internal-self-test") {
+func runCleanupSelfTest() throws {
+    let root = SyntheticFixture.root.appendingPathComponent("cleanup-" + UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let now = Date(), old = now.addingTimeInterval(-2 * 86400)
+    func qoder(_ id: String, at date: Date, lines: Int = 2) -> QoderSession {
+        QoderSession(id: id, title: "Synthetic", lastUserPreview: "fixture", state: .ready, lineCount: lines,
+                     modified: date, projectKey: root.appendingPathComponent(id).path, projectTitle: id,
+                     lastPromptAt: date, wasInterrupted: false)
+    }
+    let directory = root.appendingPathComponent("board")
+    let model = BoardModel(dataDirectory: directory, sources: .synthetic(root))
+    let stale = qoder("stale", at: old), hookOnly = qoder("hook-only", at: now, lines: 0)
+    model.mergeQoderTranscripts([stale, hookOnly, qoder("live", at: now), qoder("star", at: old),
+                                 qoder("renamed", at: old), qoder("manual", at: old), qoder("shared", at: old)])
+    let cursor = CursorSession(path: root.appendingPathComponent("cursor.jsonl").path, title: "fixture", lastUserPreview: "", modified: old,
+                               lineCount: 1, projectKey: root.appendingPathComponent("cursor-project").path, projectTitle: "cursor")
+    model.importCursor(cursor)
+    let codex = CodexSession(id: "codex-cleanup", title: "fixture", lastUserPreview: "", state: .ready, modified: old,
+                             projectKey: root.appendingPathComponent("codex-project").path, projectTitle: "codex")
+    model.mergeCodex([codex])
+    let internalSession = CodexSession(id: "internal-cleanup", title: "fixture agent", lastUserPreview: "", state: .waiting,
+        modified: now, projectKey: root.appendingPathComponent("internal-project").path, projectTitle: "internal")
+    model.mergeCodex([internalSession])
+    var metadata: OpaquePointer?
+    precondition(sqlite3_open(root.appendingPathComponent("codex.sqlite").path, &metadata) == SQLITE_OK)
+    precondition(sqlite3_exec(metadata, "CREATE TABLE threads (id TEXT, source TEXT); INSERT INTO threads VALUES ('internal-cleanup', '{\"subagent\":{\"other\":\"guardian\"}}');", nil, nil, nil) == SQLITE_OK)
+    sqlite3_close(metadata)
+    func group(_ id: String) -> BoardTask {
+        let child = model.tasks.first { $0.qoderSessionID == id }!
+        return model.tasks.first { $0.id == child.parentID }!
+    }
+    model.toggleTaskStar(group("star").id)
+    model.renameTask(group("renamed").id, to: "Custom fixture")
+    let manual = model.tasks.first { $0.qoderSessionID == "manual" }!
+    model.assignParent(manual.id, to: manual.parentID)
+    model.add("Manual owner")
+    let owner = model.tasks.first { $0.title == "Manual owner" }!
+    let shared = model.tasks.first { $0.qoderSessionID == "shared" }!
+    model.bindSession(shared.id, to: owner.id)
+    let before = model.tasks
+    precondition(model.inactiveAutoGroupCount(now: now) == 4)
+    precondition(model.cleanInactiveAutoGroups(now: now) == 5 && model.persistenceError == nil)
+    precondition(!model.tasks.contains { $0.codexThreadID == internalSession.id })
+    for id in ["live", "star", "renamed", "manual", "shared"] {
+        precondition(model.tasks.contains { $0.qoderSessionID == id })
+    }
+    precondition(model.tasks.first { $0.id == owner.id } == before.first { $0.id == owner.id })
+    precondition(model.tasks.first { $0.id == shared.id }?.boundParentIDs.contains(owner.id) == true)
+    let ignoredURL = directory.appendingPathComponent("ignored-sessions.json")
+    let ignored = try JSONDecoder().decode([String: Double].self, from: Data(contentsOf: ignoredURL))
+    precondition(ignored["qoder:stale"] == now.timeIntervalSinceReferenceDate)
+    precondition(ignored["cursor:" + cursor.path] == now.timeIntervalSinceReferenceDate)
+    precondition(ignored["codex:" + codex.id] == now.timeIntervalSinceReferenceDate)
+    let backupDirs = try FileManager.default.contentsOfDirectory(at: directory.appendingPathComponent("cleanup-backups"), includingPropertiesForKeys: nil)
+    precondition(backupDirs.count == 1)
+    for name in ["tasks.json", "tasks.json.bak"] {
+        precondition(FileManager.default.fileExists(atPath: backupDirs[0].appendingPathComponent(name).path))
+    }
+    let reloaded = BoardModel(dataDirectory: directory, sources: .synthetic(root))
+    reloaded.performBatch {
+        reloaded.mergeQoderTranscripts([stale, hookOnly]); reloaded.importCursor(cursor); reloaded.mergeCodex([codex])
+        reloaded.mergeQoderEvents([["session_id": "stale", "hook_event_name": "UserPromptSubmit",
+            "timestamp": ISO8601DateFormatter().string(from: old), "cwd": root.path]], defaults: reloaded.sources.defaults)
+    }
+    precondition(!reloaded.tasks.contains { $0.qoderSessionID == "stale" || $0.qoderSessionID == "hook-only" || $0.cursorPath == cursor.path || $0.codexThreadID == codex.id })
+    // Real transcript growth after the tombstone revives the conversation and removes its ignored key.
+    let transcriptProject = root.appendingPathComponent("qoder-fixture/project")
+    try FileManager.default.createDirectory(at: transcriptProject, withIntermediateDirectories: true)
+    let transcript = transcriptProject.appendingPathComponent("stale.jsonl")
+    let event: [String: Any] = ["type": "user", "sessionId": "stale", "cwd": stale.projectKey,
+        "timestamp": ISO8601DateFormatter().string(from: now),
+        "message": ["content": [["type": "text", "text": "fixture new activity"]]]]
+    var data = try JSONSerialization.data(withJSONObject: event); data.append(10)
+    try data.write(to: transcript)
+    try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(1)], ofItemAtPath: transcript.path)
+    reloaded.pollQoderTranscripts(root: transcriptProject.deletingLastPathComponent())
+    precondition(reloaded.tasks.contains { $0.qoderSessionID == "stale" && $0.qoderObservedLines > 0 })
+    let revivedIgnored = try JSONDecoder().decode([String: Double].self, from: Data(contentsOf: ignoredURL))
+    precondition(revivedIgnored["qoder:stale"] == nil)
+    let freshCursor = CursorSession(path: cursor.path, title: "fixture", lastUserPreview: "new fixture", modified: now.addingTimeInterval(1),
+        lineCount: 2, projectKey: cursor.projectKey, projectTitle: "cursor")
+    let freshCodex = CodexSession(id: codex.id, title: "fixture", lastUserPreview: "new fixture", state: .ready,
+        modified: now.addingTimeInterval(1), projectKey: codex.projectKey, projectTitle: "codex")
+    reloaded.performBatch { reloaded.importCursor(freshCursor); reloaded.mergeCodex([freshCodex]) }
+    let restoredAgain = BoardModel(dataDirectory: directory, sources: .synthetic(root))
+    precondition(restoredAgain.tasks.contains { $0.cursorPath == cursor.path })
+    precondition(restoredAgain.tasks.contains { $0.codexThreadID == codex.id })
+    precondition(restoredAgain.inactiveAutoGroups(now: now).allSatisfy { group in
+        !restoredAgain.children(of: group.id).contains { $0.cursorPath == cursor.path || $0.codexThreadID == codex.id }
+    })
+    for fault in ["cleanupBackup", "ignoredWrite", "write", "replace"] {
+        let dir = root.appendingPathComponent("fault-" + fault)
+        var fail = false
+        let tested = BoardModel(dataDirectory: dir, sources: .synthetic(root), storageFault: { point in
+            if fail && point == fault { throw CocoaError(.fileWriteNoPermission) }
+        })
+        tested.mergeQoderTranscripts([stale])
+        let mainURL = dir.appendingPathComponent("tasks.json"), original = try Data(contentsOf: mainURL)
+        fail = true
+        precondition(tested.cleanInactiveAutoGroups(now: now) == 0 && tested.persistenceError != nil)
+        let afterFailure = try Data(contentsOf: mainURL)
+        precondition(afterFailure == original)
+        if fault == "cleanupBackup" || fault == "ignoredWrite" {
+            precondition(!FileManager.default.fileExists(atPath: dir.appendingPathComponent("ignored-sessions.json").path))
+        }
+        fail = false; tested.retrySave()
+        precondition(tested.persistenceError == nil)
+    }
+    // Another holder changing either file cannot be overwritten by cleanup.
+    let conflictDir = root.appendingPathComponent("conflict")
+    let first = BoardModel(dataDirectory: conflictDir, sources: .synthetic(root))
+    first.mergeQoderTranscripts([stale])
+    let other = BoardModel(dataDirectory: conflictDir, sources: .synthetic(root)); other.add("External fixture")
+    precondition(first.cleanInactiveAutoGroups(now: now) == 0 && first.persistenceError != nil)
+    let ignoreConflictDir = root.appendingPathComponent("ignore-conflict")
+    let ignoreConflict = BoardModel(dataDirectory: ignoreConflictDir, sources: .synthetic(root))
+    ignoreConflict.mergeQoderTranscripts([stale])
+    let externalIgnored = Data("{\"qoder:external\":1}".utf8)
+    let externalIgnoredURL = ignoreConflictDir.appendingPathComponent("ignored-sessions.json")
+    try externalIgnored.write(to: externalIgnoredURL)
+    precondition(ignoreConflict.cleanInactiveAutoGroups(now: now) == 0 && ignoreConflict.persistenceError != nil)
+    let afterConflict = try Data(contentsOf: externalIgnoredURL)
+    precondition(afterConflict == externalIgnored)
+    let corruptDir = root.appendingPathComponent("corrupt")
+    try FileManager.default.createDirectory(at: corruptDir, withIntermediateDirectories: true)
+    try Data("not-json".utf8).write(to: corruptDir.appendingPathComponent("ignored-sessions.json"))
+    let blocked = BoardModel(dataDirectory: corruptDir, sources: .synthetic(root)); blocked.retrySave()
+    precondition(blocked.persistenceError != nil && blocked.cleanInactiveAutoGroups(now: now) == 0)
+    print("Cleanup self-test passed (tombstones, shared/manual protection, backups, revival, failures and conflicts)")
+}
+
+if CommandLine.arguments.contains("--cleanup-self-test") {
+    try runCleanupSelfTest()
+} else if CommandLine.arguments.contains("--clean-inactive-auto-groups") {
+    let model = BoardModel()
+    let count = model.cleanInactiveAutoGroups()
+    if let error = model.persistenceError {
+        FileHandle.standardError.write(Data((error + "\n").utf8)); exit(1)
+    }
+    print("已清理 \(count) 个无活跃会话的自动分组")
+} else if CommandLine.arguments.contains("--codex-internal-self-test") {
     let root = URL(fileURLWithPath: ProcessInfo.processInfo.environment["ORBIT_SYNTHETIC_ROOT"]!)
         .appendingPathComponent("internal-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -3437,7 +3745,7 @@ if CommandLine.arguments.contains("--codex-internal-self-test") {
 } else if CommandLine.arguments.contains("--display-clock-self-test") {
     try runDisplayClockSelfTest()
 } else if CommandLine.arguments.contains("--poll-snapshot-self-test") {
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-poll-" + UUID().uuidString)
+    let directory = SyntheticFixture.root.appendingPathComponent("orbit-poll-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: directory) }
     let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
     model.add("Synthetic owner")
@@ -3478,7 +3786,7 @@ if CommandLine.arguments.contains("--codex-internal-self-test") {
     precondition(!model.isPolling)
     print("Background poll snapshot and batching self-test passed")
 } else if CommandLine.arguments.contains("--poll-performance-self-test") {
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-poll-perf-" + UUID().uuidString)
+    let directory = SyntheticFixture.root.appendingPathComponent("orbit-poll-perf-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
     let logs = directory.appendingPathComponent("qoder")
@@ -3533,7 +3841,7 @@ if CommandLine.arguments.contains("--codex-internal-self-test") {
     precondition(p95 <= 16 && ordered.last! <= 50 && zip(reads, merges).allSatisfy { $0 + $1 < 5000 })
     print("Background poll performance self-test passed")
 } else if CommandLine.arguments.contains("--codex-format-self-test") {
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-format-" + UUID().uuidString)
+    let directory = SyntheticFixture.root.appendingPathComponent("orbit-format-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
     let file = directory.appendingPathComponent("thread.jsonl")
@@ -3596,7 +3904,7 @@ if CommandLine.arguments.contains("--codex-internal-self-test") {
     precondition(CodexReader.databaseDiagnostic(at: missing) == .readFailure)
     print("Codex format and diagnostics self-test passed")
 } else if CommandLine.arguments.contains("--latest-navigation-self-test") {
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-navigation-" + UUID().uuidString)
+    let directory = SyntheticFixture.root.appendingPathComponent("orbit-navigation-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: directory) }
     let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
     let now = Date()
@@ -3634,7 +3942,7 @@ if CommandLine.arguments.contains("--codex-internal-self-test") {
     precondition(opened.isEmpty)
     print("Latest navigation self-test passed")
 } else if CommandLine.arguments.contains("--completion-override-self-test") {
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-completion-" + UUID().uuidString)
+    let directory = SyntheticFixture.root.appendingPathComponent("orbit-completion-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: directory) }
     let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
     let session = CodexSession(id: "shared-session", title: "共享会话", lastUserPreview: "合成输入", state: .waiting,
@@ -3690,7 +3998,7 @@ if CommandLine.arguments.contains("--codex-internal-self-test") {
     precondition(!explicitFalse.completionOverride)
     print("Completion override self-test passed")
 } else if CommandLine.arguments.contains("--grouping-intent-self-test") {
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-intent-" + UUID().uuidString)
+    let directory = SyntheticFixture.root.appendingPathComponent("orbit-intent-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: directory) }
     let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
     let session = CodexSession(id: "intent-thread", title: "会话", lastUserPreview: "合成输入", state: .waiting,
@@ -3715,7 +4023,7 @@ if CommandLine.arguments.contains("--codex-internal-self-test") {
     precondition(try! encoder.encode(BoardModel.normalizedAutoGroups(twice.tasks)) == encoder.encode(twice.tasks))
     print("Grouping intent self-test passed")
 } else if CommandLine.arguments.contains("--cache-concurrency-self-test") {
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-cache-" + UUID().uuidString)
+    let directory = SyntheticFixture.root.appendingPathComponent("orbit-cache-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
     let rollout = directory.appendingPathComponent("thread.jsonl")
@@ -3748,7 +4056,7 @@ if CommandLine.arguments.contains("--codex-internal-self-test") {
     let sessions = CodexReader.sessions()
     print("Codex sessions: \(sessions.count), waiting: \(sessions.filter { $0.state == .waiting }.count), ready: \(sessions.filter { $0.state == .ready }.count)")
 } else if CommandLine.arguments.contains("--codex-recent-self-test") {
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("deskfocus-recent-\(UUID().uuidString)")
+    let directory = SyntheticFixture.root.appendingPathComponent("deskfocus-recent-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
     let databaseURL = directory.appendingPathComponent("recent.sqlite")
@@ -3793,7 +4101,22 @@ if CommandLine.arguments.contains("--codex-internal-self-test") {
     precondition(!restored.visibleChildren(of: second.id).contains { $0.codexThreadID == threadID })
     print("Codex recent self-test passed")
 } else if CommandLine.arguments.contains("--auto-group-repair-self-test") {
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-group-repair-\(UUID().uuidString)")
+    let temporaryA = "/synthetic/Documents/Qoder/2026-10-19/7aaa6eb6"
+    let temporaryB = "/synthetic/Documents/Qoder/2026-10-20/cc38fb5b"
+    var groupA = BoardTask(title: "7aaa6eb6"); groupA.isAutoGroup = true; groupA.projectKey = temporaryA
+    var groupB = BoardTask(title: "cc38fb5b"); groupB.isAutoGroup = true; groupB.projectKey = temporaryB; groupB.isPinned = true
+    var childA = BoardTask(title: "fixture A"); childA.qoderSessionID = "temporary-a"; childA.projectKey = temporaryA; childA.parentID = groupA.id
+    var childB = BoardTask(title: "fixture B"); childB.qoderSessionID = "temporary-b"; childB.projectKey = temporaryB; childB.parentID = groupB.id
+    let normalized = BoardModel.normalizedAutoGroups([groupA, groupB, childA, childB])
+    let temporaryGroups = normalized.filter { $0.isAutoGroup }
+    precondition(temporaryGroups.count == 1 && temporaryGroups[0].title == WorkspaceGrouping.temporaryTitle && temporaryGroups[0].isPinned)
+    precondition(normalized.filter(\.isConversation).allSatisfy { $0.parentID == temporaryGroups[0].id && $0.projectKey == WorkspaceGrouping.temporaryKey })
+    precondition(BoardModel.normalizedAutoGroups(normalized) == normalized)
+    precondition(!WorkspaceGrouping.isTemporaryWorkspace("/synthetic/project/7aaa6eb6"))
+    precondition(!WorkspaceGrouping.isTemporaryWorkspace("/synthetic/Qoder/2026-10-19/real-project"))
+    groupB.isTitleCustomized = true; groupB.title = "Custom temporary fixture"
+    precondition(BoardModel.normalizedAutoGroups([groupA, groupB, childA, childB]).first { $0.isAutoGroup }?.title == "Custom temporary fixture")
+    let directory = SyntheticFixture.root.appendingPathComponent("orbit-group-repair-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
     let key = directory.appendingPathComponent("project").path
@@ -3846,7 +4169,7 @@ if CommandLine.arguments.contains("--codex-internal-self-test") {
     precondition(restored.tasks.filter { $0.isAutoGroup && $0.projectKey == key }.count == 1)
     print("Automatic group repair self-test passed")
 } else if CommandLine.arguments.contains("--qoder-resume-self-test") {
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-qoder-resume-\(UUID().uuidString)")
+    let directory = SyntheticFixture.root.appendingPathComponent("orbit-qoder-resume-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
     let root = directory.appendingPathComponent("projects")
@@ -3936,7 +4259,7 @@ if CommandLine.arguments.contains("--codex-internal-self-test") {
     let end: [String: Any] = ["type": "turn_ended"]
     precondition(CursorReader.inferredState(in: [user]) == .waiting)
     precondition(CursorReader.inferredState(in: [user, assistant, end]) == .human)
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("deskfocus-human-\(UUID().uuidString)")
+    let directory = SyntheticFixture.root.appendingPathComponent("deskfocus-human-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: directory) }
     let qoderRoot = directory.appendingPathComponent("qoder-projects")
     let qoderProject = qoderRoot.appendingPathComponent("example")
@@ -3963,7 +4286,7 @@ if CommandLine.arguments.contains("--codex-internal-self-test") {
 } else if CommandLine.arguments.contains("--codex-self-test") {
     precondition(userInputPreview(String(repeating: "字", count: 31)) == String(repeating: "字", count: 30) + "…")
     precondition(userInputPreview("第一行\n 第二行") == "第一行 第二行")
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("deskfocus-codex-\(UUID().uuidString)")
+    let directory = SyntheticFixture.root.appendingPathComponent("deskfocus-codex-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
     let databaseURL = directory.appendingPathComponent("state_5.sqlite")
@@ -4012,7 +4335,7 @@ if CommandLine.arguments.contains("--codex-internal-self-test") {
     precondition(CodexReader.sessions(databaseURL: databaseURL)[0].state == .human)
     print("Codex self-test passed")
 } else if CommandLine.arguments.contains("--grouping-self-test") {
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("deskfocus-grouping-\(UUID().uuidString)")
+    let directory = SyntheticFixture.root.appendingPathComponent("deskfocus-grouping-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: directory) }
     let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
     let first = CursorSession(path: "/tmp/one.jsonl", title: "会话一", lastUserPreview: "会话一", modified: Date(), lineCount: 1,
@@ -4052,7 +4375,7 @@ if CommandLine.arguments.contains("--codex-internal-self-test") {
     precondition(restored.children(of: restored.active[0].id).count == 2)
     print("Grouping self-test passed")
 } else if CommandLine.arguments.contains("--lifecycle-self-test") {
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("deskfocus-lifecycle-\(UUID().uuidString)")
+    let directory = SyntheticFixture.root.appendingPathComponent("deskfocus-lifecycle-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: directory) }
     let model = BoardModel(dataDirectory: directory, sources: .synthetic(directory))
     let now = Date()

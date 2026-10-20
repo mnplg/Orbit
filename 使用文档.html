@@ -55,6 +55,11 @@
   <p>任务数据位置：<span class="path">~/Library/Application Support/DeskFocusBoard/tasks.json</span>。这个内部目录名为兼容旧版而保留，升级为 Orbit 不会重置任务数据。程序只读取本机的 Cursor / Qoder / Codex 会话记录，并保存任务状态、项目归组和必要的 Hook 事件信息。Codex 的本地记录位于 <span class="path">~/.codex/</span>；记录格式可能随 Codex 版本变化。</p>
   <p>换电脑时，任务数据不会随应用自动迁移；如果需要保留任务，可在旧电脑复制整个 <span class="path">DeskFocusBoard</span> 文件夹到新电脑同一位置。</p>
 
+  <h3>清理无活跃自动分组</h3>
+  <p>标题栏垃圾桶可清理没有真实活跃会话的自动分组，确认后执行。星标、改名、手动任务及含手动归属或共享绑定的分组不受影响；没有可清理项时按钮不可用。Qoder 只有 hook 重放、没有 transcript 内容时不算真实活跃。</p>
+  <p>程序先在本机数据目录的 <span class="path">cleanup-backups</span> 保存备份，再保存忽略名单和任务。旧会话不会在轮询或重启后重新导入，有新活动时会重新出现；清理失败会显示保存错误。不要直接删除任务文件。</p>
+  <p>Qoder 未绑定真实工作区的日期与随机目录会统一归为“临时会话”，已有自定义名称与手动绑定会保留。</p>
+
   <h2>五、常见问题</h2>
   <p>Codex 子智能体及内部审查会话会自动过滤，不显示在看板中，也不计入会话数量；正常会话不受影响。</p>
   <h3>启动后没有会话</h3><p>确认 Cursor、Qoder 或 Codex 已经产生本地会话；Qoder 需要先运行连接脚本并重启。任务板每 5 秒同步一次，也可以退出后重新打开。</p>

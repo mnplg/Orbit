@@ -13,7 +13,7 @@ ulimit -c 0
 swiftc -module-cache-path "${ORBIT_MODULE_CACHE:-$WORK/module-cache}" -framework AppKit -framework SwiftUI "$ROOT/Sources/main.swift" "$ROOT/Sources/QoderDesktopNavigator.swift" -o "$WORK/Orbit"
 swiftc -module-cache-path "${ORBIT_MODULE_CACHE:-$WORK/module-cache}" -O "$ROOT/Sources/qoder-hook.swift" -o "$WORK/QoderHook"
 swiftc -module-cache-path "${ORBIT_MODULE_CACHE:-$WORK/module-cache}" -framework AppKit "$ROOT/Sources/QoderDesktopNavigator.swift" "$ROOT/Tests/QoderDesktopNavigation/main.swift" -o "$WORK/navigation-tests"
-for name in codex-internal termination-protection storage-transaction display-clock codex-recent auto-group-repair qoder-resume human-state codex grouping lifecycle persistence cache-concurrency grouping-intent completion-override latest-navigation codex-format poll-snapshot; do
+for name in cleanup codex-internal termination-protection storage-transaction display-clock codex-recent auto-group-repair qoder-resume human-state codex grouping lifecycle persistence cache-concurrency grouping-intent completion-override latest-navigation codex-format poll-snapshot; do
     "$WORK/Orbit" "--$name-self-test"
 done
 "$WORK/navigation-tests"
@@ -30,6 +30,7 @@ if ORBIT_READER_ESCAPE="$OUTSIDE" "$WORK/Orbit" --reader-escape-self-test >"$WOR
     echo "Reader boundary spy did not reject external fixture root"; exit 1
 fi
 /usr/bin/grep -q 'Synthetic reader escaped fixture root' "$WORK/escape.log"
+rm -f "$WORK/symlink-escape.jsonl"
 ln -s "$OUTSIDE/sentinel.jsonl" "$WORK/symlink-escape.jsonl"
 if ORBIT_SYMLINK_ESCAPE="$WORK/symlink-escape.jsonl" "$WORK/Orbit" --reader-symlink-self-test >"$WORK/symlink.log" 2>&1; then
     rm -rf "$OUTSIDE"

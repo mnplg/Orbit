@@ -2,7 +2,7 @@ import Foundation
 import SQLite3
 
 func runTests() throws {
- let dir=FileManager.default.temporaryDirectory.appendingPathComponent("orbit-desktop-nav-test-\(UUID().uuidString)")
+ let dir=URL(fileURLWithPath: ProcessInfo.processInfo.environment["ORBIT_SYNTHETIC_ROOT"]!).appendingPathComponent("orbit-desktop-nav-test-\(UUID().uuidString)")
  try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
  defer {try? FileManager.default.removeItem(at:dir)}
  let file=dir.appendingPathComponent("test.sqlite")
